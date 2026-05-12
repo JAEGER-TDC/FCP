@@ -255,7 +255,8 @@ class FCPController:
         Priority: sticky current zone-3 target → closest zone-3 RAT →
         closest zone-2 RAT → None.
         """
-        rats = dict(self.model.rats)
+        rats = {rid: r for rid, r in self.model.rats.items()
+                if rid not in self.model.neutralized_rats}
         current = self.model.primary_target_id
         if current and current in rats and rats[current].zone == 3:
             return current
@@ -362,6 +363,7 @@ class FCPController:
 
         self.model.cv_state       = new_state
         self.model.cv_confidence  = meta['confidence']
+        self.view.video_frame.update_cv_status(new_state, meta['confidence'])
         self.model.cv_centroid    = (meta['cx'], meta['cy'])
         self.model.cv_frame_size  = (meta['frame_w'], meta['frame_h'])
         self.model.cv_last_update = time.time()
@@ -451,13 +453,21 @@ class FCPController:
     def _neutralize_rat(self, rat_id: str):
         """Confirm a kill: log neutralized event, remove from engaged set, alert operator."""
         self.model.engaged_rats.discard(rat_id)
+        if hasattr(self.cv_engine, 'set_engaged'):
+            self.cv_engine.set_engaged(bool(self.model.engaged_rats))
+        self.model.neutralized_rats.add(rat_id)
+        if self.model.pending_engage_rat_id == rat_id:
+            self.model.pending_engage_rat_id = None
         self._engage_dwell.pop(rat_id, None)
+        self._send_hit_confirmation(rat_id)
         self.model.analytics_db.log_rat_event(rat_id, 'neutralized')
         self.view.alert_frame.add_alert(f'RAT {rat_id} NEUTRALIZED', INFO)
         primary_id = self._select_primary_target()
         self.model.primary_target_id = primary_id
         self.view.after(0, lambda p=primary_id, e=set(self.model.engaged_rats):
             self.view.map_frame.update_engagement_state(p, e))
+        self.view.after(0, lambda n=set(self.model.neutralized_rats):
+            self.view.map_frame.update_neutralized_rats(n))
         self.view.after(0, lambda: self.view.control_frame.update_engagement_active(
             bool(self.model.engaged_rats)))
 
@@ -484,6 +494,22 @@ class FCPController:
         self.view.alert_frame.add_alert(f'Acoustic detection {"enabled" if enabled else "disabled"}')
         self.model.analytics_db.log_sensor_event('acoustic', 'enabled' if enabled else 'disabled')
         self._send_detection_command('acoustic', bool(enabled))
+
+    #===================================================================
+
+    def _send_hit_confirmation(self, rat_id: str) -> None:
+        """Notify the DNN that a RAT has been confirmed neutralized."""
+        msg = {
+            "msg_type": "hit_confirmed",
+            "rat_id": rat_id,
+            "current_time": time.strftime('%Y-%m-%dT%H:%M:%S'),
+        }
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(json.dumps(msg).encode('utf-8'), (self.dnn_send_ip, self.dnn_send_port))
+            sock.close()
+        except Exception as e:
+            print(f"Failed to send hit confirmation for {rat_id}: {e}")
 
     #===================================================================
 
@@ -529,6 +555,7 @@ class FCPController:
             self._known_rats.discard(rat_id)
             self._rat_zones.pop(rat_id, None)
             self.model.engaged_rats.discard(rat_id)
+            self.model.neutralized_rats.discard(rat_id)
             if self.model.primary_target_id == rat_id:
                 self.model.primary_target_id = None
             if self.model.pending_engage_rat_id == rat_id:
@@ -541,6 +568,7 @@ class FCPController:
                        for z in (1, 2, 3)}
         any_z3 = zone_counts.get(3, 0) > 0
         self.view.map_frame.update_zone_counts(zone_counts, dict(self.model.rats))
+        self.view.map_frame.update_neutralized_rats(set(self.model.neutralized_rats))
         self.view.after(0, lambda az3=any_z3: self.view.control_frame.update_engage_state(az3))
         self.view.after(0, lambda p=primary_id, e=set(self.model.engaged_rats):
             self.view.map_frame.update_engagement_state(p, e))
@@ -555,6 +583,8 @@ class FCPController:
         print(f"Engaged RAT: {rat_id}")
         self.model.analytics_db.log_rat_event(rat_id, 'engage_commanded')
         self.model.engaged_rats.add(rat_id)
+        if self.cv_engine is not None and hasattr(self.cv_engine, 'set_engaged'):
+            self.cv_engine.set_engaged(True)
         rat = self.model.rats.get(rat_id)
         if rat:
             self._send_dne_targeting(rat, fire=1, state_command=2)
@@ -594,6 +624,8 @@ class FCPController:
             return
         was_engaged = pid in self.model.engaged_rats
         self.model.engaged_rats.discard(pid)
+        if self.cv_engine is not None and hasattr(self.cv_engine, 'set_engaged'):
+            self.cv_engine.set_engaged(bool(self.model.engaged_rats))
         self.model.pending_engage_rat_id = None
         rat = self.model.rats.get(pid)
         if rat and rat.zone >= 2:

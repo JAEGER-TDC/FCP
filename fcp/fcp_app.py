@@ -2,7 +2,9 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-import tkinter as tk
+from PyQt6.QtWidgets import QApplication, QMainWindow, QLineEdit, QTextEdit
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QIcon
 
 from model.fcp_model import FCPModel
 from view.fcp_view import FCPView
@@ -10,15 +12,16 @@ from controller.fcp_controller import FCPController
 import view.theme as theme
 from view.cv_launch_dialog import CVLaunchDialog
 
-class FCPApp(tk.Tk):
+
+class FCPApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.setWindowTitle('JAEGER Forward Command Post')
+        self.resize(1280, 720)
 
-        theme.apply(self)
-        self.title('JAEGER Forward Command Post')
-        self.geometry('1280x720+50+50')
-        icon = tk.PhotoImage(file=os.path.join(os.path.dirname(__file__), 'assets', 'jaeger_logo.png'))
-        self.iconphoto(True, icon)
+        icon_path = os.path.join(os.path.dirname(__file__), 'assets', 'jaeger_logo.png')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         self._model = FCPModel()
         self._model.analytics_db.start_mission()
@@ -28,54 +31,52 @@ class FCPApp(tk.Tk):
         for sensor in ('lidar', 'rf', 'acoustic'):
             db.log_sensor_event(sensor, 'enabled')
 
-        self.view = FCPView()
-        self.view.pack(fill='both', expand=True)
+        self._view = FCPView(self)
+        self.setCentralWidget(self._view)
 
-        self.controller = FCPController(self._model, self.view)
-        self.view.set_controller(self.controller)
+        self._controller = FCPController(self._model, self._view)
+        self._view.set_controller(self._controller)
         _config_path = os.path.join(os.path.dirname(__file__), 'cfg', 'config.ini')
-        self.view.init_gui(config_path=_config_path)
-        self.view.video_frame.set_load_callback(self.controller.load_video)
-        self.view.video_frame.set_alert_callback(self.view.alert_frame.add_alert)
-        self.after(100, lambda: CVLaunchDialog(self, self.controller))
+        self._view.init_gui(config_path=_config_path)
 
-        # CV keyboard shortcuts (ignore when focus is in a text-entry widget)
-        self.bind('<space>', self._cv_key)
-        self.bind('r',       self._cv_key)
-        self.bind('s',       self._cv_key)
-        self.bind('v',       self._cv_key)
-        self.bind('q',       self._cv_key)
+        self._view.video_frame.set_load_callback(self._controller.load_video)
+        self._view.video_frame.set_alert_callback(self._view.alert_frame.add_alert)
+        QTimer.singleShot(100, self._show_cv_dialog)
 
         # Do an initial analytics refresh so tables populate immediately
-        self.view.analytics_frame.refresh()
+        self._view.analytics_frame.refresh()
 
-        # Close the mission cleanly on window close
-        self.protocol('WM_DELETE_WINDOW', self._on_close)
+    def _show_cv_dialog(self):
+        CVLaunchDialog(self, self._controller).exec()
 
-    #===================================================================
+    def keyPressEvent(self, event):
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QLineEdit, QTextEdit)):
+            return super().keyPressEvent(event)
+        k = event.key()
+        if k == Qt.Key.Key_Space:
+            self._controller.cv_pause_toggle()
+        elif k == Qt.Key.Key_R:
+            self._controller.cv_reset_tracking()
+        elif k == Qt.Key.Key_S:
+            self._controller.cv_screenshot()
+        elif k == Qt.Key.Key_V:
+            self._controller.cv_restart_video()
+        elif k == Qt.Key.Key_Q:
+            self.close()
+        else:
+            super().keyPressEvent(event)
 
-    def _cv_key(self, event):
-        # Don't fire shortcuts while typing in a text-entry widget
-        if isinstance(event.widget, (tk.Text, tk.Entry)):
-            return
-        k = event.keysym.lower()
-        if k == 'space':
-            self.controller.cv_pause_toggle()
-        elif k == 'r':
-            self.controller.cv_reset_tracking()
-        elif k == 's':
-            self.controller.cv_screenshot()
-        elif k == 'v':
-            self.controller.cv_restart_video()
-        elif k == 'q':
-            self._on_close()
-
-    def _on_close(self):
-        self.view.save_layout()
+    def closeEvent(self, event):
+        self._view.save_layout()
         self._model.analytics_db.end_mission()
         self._model.analytics_db.close()
-        self.destroy()
+        super().closeEvent(event)
+
 
 if __name__ == '__main__':
-    app = FCPApp()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    theme.apply(app)
+    window = FCPApp()
+    window.showMaximized()
+    sys.exit(app.exec())
