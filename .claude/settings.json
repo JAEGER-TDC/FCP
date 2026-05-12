@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git restore *)",
+      "Bash(git pull *)",
+      "Bash(ls /home/lockheed/.claude/plans/ 2>/dev/null || echo \"Plans directory does not exist\")",
+      "Read(//home/lockheed/.claude/plans/**)",
+      "Bash(mkdir -p /home/lockheed/.claude/plans && ls /home/lockheed/.claude/plans/)",
+      "Bash(python3 -c ' *)",
+      "Bash(poetry run *)",
+      "Bash(python3 -c \"import tensorrt; print\\('TRT in system python:', tensorrt.__version__\\)\")",
+      "Bash(pip3 show *)",
+      "Bash(pip show *)",
+      "Read(//usr/local/lib/**)",
+      "Read(//home/lockheed/.local/**)",
+      "Bash(python3 -c \"import sys; print\\('\\\\n'.join\\(sys.path\\)\\)\")",
+      "Bash(ls /usr/local/lib/python3.12/dist-packages/ | grep -i tensor 2>/dev/null; ls /usr/lib/python3/dist-packages/ | grep -i tensor 2>/dev/null; find /usr/local -name \"*.so\" 2>/dev/null | grep -i trt | head -10)",
+      "Read(//usr/lib/python3/dist-packages/**)",
+      "Read(//usr/local/**)",
+      "Read(//home/lockheed/FCP_CV_Project/venv/lib/python3.12/site-packages/**)",
+      "Bash(/home/lockheed/FCP_CV_Project/venv/bin/python -c \"import tensorrt; import cupy; print\\('TRT:', tensorrt.__version__, 'CuPy:', cupy.__version__\\)\")",
+      "Bash(ls /dev/video* 2>/dev/null && echo \"Camera devices found\" || echo \"No camera devices found in WSL2\")",
+      "Read(//dev/**)",
+      "Bash(lsusb)",
+      "Bash(lsmod)",
+      "Bash(modinfo uvcvideo *)",
+      "Bash(sudo dmesg)",
+      "Bash(dmesg)"
+    ],
+    "additionalDirectories": [
+      "/home/lockheed/.claude/plans"
+    ]
+  }
+}
