@@ -20,3 +20,5 @@ fcp/data/
 # Big CV files
 fcp/cv/best.onnx
 *.onnx
+*.pt
+*.engine
