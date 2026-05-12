@@ -1,13 +1,13 @@
 """
 cv_engine_sim.py — Simulated CV tracking engine.
 
-Reads RAT-CV-1.mp4, runs a scripted state machine, and renders the full
+Reads drone.mp4, runs a scripted state machine, and renders the full
 cv.py HUD (via cv_draw) onto each frame.  Implements the same interface
 as the future real TRT engine so no other code needs to change when
 hardware is available.
 
 State cycle (loops indefinitely):
-    SEARCHING (0.3 s) → LOCKED (17 s) → DARK LOCK (2 s) → PREDICTING (0.7 s) → …
+    SEARCHING (2 s) → LOCKED (5 s) → DARK LOCK (3 s) → PREDICTING (2 s) → …
 
 Centroid follows a compound sinusoidal path so the crosshair moves
 realistically across the frame even during non-LOCKED states.
@@ -23,16 +23,15 @@ import cv2
 import numpy as np
 
 from cv.cv_draw import Config, _draw_hud, _draw_trail, _draw_zoom_inset, compute_laser_pos
-from cv.cv_engine_base import CVEngineBase
 
 
 _STATE_CYCLE = ["SEARCHING", "LOCKED", "DARK LOCK", "PREDICTING"]
 
 _STATE_DURATIONS = {
-    "SEARCHING":  0.3,    # ~1.5% of cycle
-    "LOCKED":     17.0,   # ~85% of cycle
-    "DARK LOCK":  2.0,    # ~10% of cycle
-    "PREDICTING": 0.7,    # ~3.5% of cycle
+    "SEARCHING":  2.0,
+    "LOCKED":     5.0,
+    "DARK LOCK":  3.0,
+    "PREDICTING": 2.0,
 }
 
 _STATE_COLORS = {
@@ -43,7 +42,7 @@ _STATE_COLORS = {
 }
 
 
-class CVEngineSimulator(CVEngineBase):
+class CVEngineSimulator:
     """
     Simulated CV engine.  Drop-in replacement for the future TRT-based engine.
 
@@ -64,9 +63,13 @@ class CVEngineSimulator(CVEngineBase):
             "cx": 0, "cy": 0, "frame_w": 0, "frame_h": 0,
             "gimbal_err_px": 0.0, "on_target": False,
         }
-        self._meta_lock  = threading.Lock()
-        self._stop_evt   = threading.Event()
-        self._engaged    = threading.Event()   # set while a RAT is actively being engaged
+        self._meta_lock          = threading.Lock()
+        self._stop_evt           = threading.Event()
+        self._reset_tracking_evt = threading.Event()
+        self._restart_video_evt  = threading.Event()
+        self._screenshot_request = threading.Event()
+        self._paused             = False
+        self._last_frame: np.ndarray | None = None
         self._thread: threading.Thread | None = None
 
     # ── Public interface ──────────────────────────────────────────
@@ -97,13 +100,21 @@ class CVEngineSimulator(CVEngineBase):
         with self._meta_lock:
             return dict(self._meta)
 
-    def set_engaged(self, engaged: bool) -> None:
-        """Sim-only: when True, centroid locks onto the laser position so dwell
-        accumulates and hit confirmation fires.  No-op on real hardware (see CVEngineBase)."""
-        if engaged:
-            self._engaged.set()
-        else:
-            self._engaged.clear()
+    def pause_toggle(self) -> bool:
+        self._paused = not self._paused
+        return self._paused
+
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def reset_tracking(self) -> None:
+        self._reset_tracking_evt.set()
+
+    def take_screenshot(self) -> None:
+        self._screenshot_request.set()
+
+    def restart_video(self) -> None:
+        self._restart_video_evt.set()
 
     # ── Background thread ─────────────────────────────────────────
 
@@ -137,6 +148,28 @@ class CVEngineSimulator(CVEngineBase):
         prev_t = time.perf_counter()
 
         while not self._stop_evt.is_set():
+            if self._paused:
+                self._stop_evt.wait(0.05)
+                continue
+
+            if self._reset_tracking_evt.is_set():
+                self._reset_tracking_evt.clear()
+                state_idx = 0
+                status = _STATE_CYCLE[state_idx]
+                color  = _STATE_COLORS[status]
+                state_elapsed = 0.0
+                trail.clear()
+
+            if self._restart_video_evt.is_set():
+                self._restart_video_evt.clear()
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                state_idx = 0
+                status = _STATE_CYCLE[state_idx]
+                color  = _STATE_COLORS[status]
+                state_elapsed = 0.0
+                trail.clear()
+                frame_num = 0
+
             t0 = time.perf_counter()
             dt = max(t0 - prev_t, 1e-6)
             prev_t = t0
@@ -158,19 +191,10 @@ class CVEngineSimulator(CVEngineBase):
                 status    = _STATE_CYCLE[state_idx]
                 color     = _STATE_COLORS[status]
 
-            # ── Advance centroid ──────────────────────────────────
+            # ── Advance centroid sinusoid ─────────────────────────
             phase += dt * 0.4   # ~16-second full horizontal sweep
-            if self._engaged.is_set() and status == "LOCKED":
-                # Simulate gimbal successfully slewed onto target: hold centroid
-                # near the laser with small noise.  This is sim-only behaviour
-                # guarded by set_engaged(); real hardware derives on_target from
-                # actual sensor data and never calls this path.
-                laser_x_pre, laser_y_pre = compute_laser_pos(w, h, self._cfg)
-                cx = int(laser_x_pre + np.random.normal(0, 5))
-                cy = int(laser_y_pre + np.random.normal(0, 5))
-            else:
-                cx = int((0.5 + 0.35 * math.sin(phase)) * w)
-                cy = int((0.35 + 0.15 * math.sin(phase * 0.7 + 1.0)) * h)
+            cx = int((0.5 + 0.35 * math.sin(phase)) * w)
+            cy = int((0.35 + 0.15 * math.sin(phase * 0.7 + 1.0)) * h)
 
             # Velocity (px/frame, approximate)
             vx = (cx - prev_cx) / max(dt, 1e-6)
@@ -223,6 +247,15 @@ class CVEngineSimulator(CVEngineBase):
 
             if self._cfg.SHOW_ZOOM_INSET and status in ("LOCKED", "DARK LOCK"):
                 _draw_zoom_inset(show, frame, cx, cy, self._cfg, color)
+
+            self._last_frame = show
+
+            if self._screenshot_request.is_set():
+                self._screenshot_request.clear()
+                import time as _t
+                fname = f"cv_shot_{int(_t.time())}.png"
+                cv2.imwrite(fname, show)
+                print(f"[CV] Screenshot saved: {fname}")
 
             # ── Push to display queue ─────────────────────────────
             try:

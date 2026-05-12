@@ -53,7 +53,7 @@ class FCPView(QWidget):
         self.video_frame = video_frame.VideoFrame(self._top_splitter)
         self._top_splitter.addWidget(self.video_frame)
         self._top_splitter.setStretchFactor(0, 2)
-        self.video_frame.play_cv_engine(self.controller.cv_engine)
+        # CV engine started by CVLaunchDialog after mode selection — not auto-started here
 
         self.map_frame = map_frame.MapFrame(self._top_splitter)
         self._top_splitter.addWidget(self.map_frame)

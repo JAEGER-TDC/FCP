@@ -12,6 +12,7 @@ from model.node_model import Node
 from view.fcp_view import FCPView
 from protocol.dne_target import Target, PacketReceiver, make_packet
 from view.frames.alert_frame import INFO, WARNING, ERROR
+from cv.cv_engine import CVEngine
 from cv.cv_engine_sim import CVEngineSimulator
 
 
@@ -41,9 +42,9 @@ class FCPController:
         self._ser: serial.SerialBase | None = None
         self._ser_lock = threading.Lock()
 
-        # CV engine — created here so fcp_view.init_gui() can wire it to the video panel
-        _video_path = os.path.join(os.path.dirname(__file__), '..', 'assets', 'RAT-CV-1.mp4')
-        self.cv_engine = CVEngineSimulator(video_path=_video_path)
+        # CV engine — set by start_mode_* after CVLaunchDialog selection
+        self.cv_engine = None
+
 
         # Per-RAT accumulated on-target dwell seconds; reset when off-target or lock lost
         self._engage_dwell: dict[str, float] = {}
@@ -339,20 +340,26 @@ class FCPController:
 
     def _poll_cv_state(self):
         """Poll the CV engine metadata every 100 ms, update model, fire state-change alerts."""
+        if self.cv_engine is None:
+            self.view.after(100, self._poll_cv_state)
+            return
+
+        err = getattr(self.cv_engine, 'get_error', lambda: None)()
+        if err:
+            self.view.alert_frame.add_alert(
+                f'CV engine error: {err} — switching to simulator', WARNING)
+            _default = os.path.join(os.path.dirname(__file__), '..', 'assets', 'RAT-CV-1.mp4')
+            _video = getattr(self.cv_engine, '_video_path', None) or _default
+            if not _video:  # camera mode has no video path — use default
+                _video = _default
+            self.cv_engine = CVEngineSimulator(video_path=_video)
+            self.view.video_frame.play_cv_engine(self.cv_engine)
+            self.view.after(100, self._poll_cv_state)
+            return
+
         meta       = self.cv_engine.get_metadata()
         new_state  = meta['state']
         prev_state = self.model.cv_state
-
-        if new_state != prev_state:
-            _SEV = {
-                'LOCKED':     INFO,
-                'DARK LOCK':  INFO,
-                'PREDICTING': WARNING,
-                'SEARCHING':  WARNING,
-            }
-            sev = _SEV.get(new_state, INFO)
-            self.view.alert_frame.add_alert(
-                f'CV tracker: {prev_state} → {new_state}', sev)
 
         self.model.cv_state       = new_state
         self.model.cv_confidence  = meta['confidence']
@@ -361,7 +368,13 @@ class FCPController:
         self.model.cv_frame_size  = (meta['frame_w'], meta['frame_h'])
         self.model.cv_last_update = time.time()
 
-        # Log CV confidence each time tracker acquires LOCKED state
+        if new_state != prev_state:
+            _SEV = {'LOCKED': INFO, 'DARK LOCK': INFO, 'PREDICTING': WARNING, 'SEARCHING': WARNING}
+            self.view.alert_frame.add_alert(
+                f'CV tracker: {prev_state} → {new_state}',
+                _SEV.get(new_state, INFO))
+
+        # Log CV confidence each time tracker acquires LOCKED state (immediate, not debounced)
         if new_state == 'LOCKED' and prev_state != 'LOCKED':
             self.model.analytics_db.log_rat_event(
                 'CV_SYSTEM', 'cv_lock', confidence=meta['confidence'])
@@ -378,10 +391,70 @@ class FCPController:
 
         self.view.after(100, self._poll_cv_state)   # reschedule
 
+    # ── CV mode entry points (called by CVLaunchDialog and Load Video button) ──
+
+    def start_mode_simulator(self) -> None:
+        """Scripted oval-track simulator — no GPU needed."""
+        _video = os.path.join(os.path.dirname(__file__), '..', 'assets', 'RAT-CV-1.mp4')
+        if self.cv_engine is not None:
+            self.cv_engine.stop()
+        self.cv_engine = CVEngineSimulator(video_path=_video)
+        self.view.video_frame.play_cv_engine(self.cv_engine)
+
+    def start_mode_video(self, path: str) -> None:
+        """Real CV (TensorRT) on a video file."""
+        if self.cv_engine is not None:
+            self.cv_engine.stop()
+        self.cv_engine = CVEngine(video_path=path)
+        self.view.video_frame.play_cv_engine(self.cv_engine)
+
+    def start_mode_camera(self, camera_index: int = 0) -> None:
+        """Real CV (TensorRT) on a live USB camera feed."""
+        from cv.cv_draw import Config as DrawConfig
+        cfg = DrawConfig(USE_LIVE_CAMERA=True, CAMERA_INDEX=camera_index)
+        if self.cv_engine is not None:
+            self.cv_engine.stop()
+        self.cv_engine = CVEngine(video_path=None, cfg=cfg)
+        self.view.video_frame.play_cv_engine(self.cv_engine)
+
+    def load_video(self, path: str) -> None:
+        """Load a new video into the current mode (real CV if possible)."""
+        self.start_mode_video(path)
+
+    def cv_pause_toggle(self) -> None:
+        """Toggle CV engine pause/resume (SPACE key)."""
+        if self.cv_engine is None or not hasattr(self.cv_engine, 'pause_toggle'):
+            return
+        paused = self.cv_engine.pause_toggle()
+        self.view.alert_frame.add_alert(
+            f"CV: {'Paused' if paused else 'Resumed'}", INFO)
+
+    def cv_reset_tracking(self) -> None:
+        """Reset CV tracking state to SEARCHING (r key)."""
+        if self.cv_engine is None or not hasattr(self.cv_engine, 'reset_tracking'):
+            return
+        self.cv_engine.reset_tracking()
+        self.view.alert_frame.add_alert("CV: Tracking reset", INFO)
+
+    def cv_screenshot(self) -> None:
+        """Save current CV frame to disk (s key)."""
+        if self.cv_engine is None or not hasattr(self.cv_engine, 'take_screenshot'):
+            return
+        self.cv_engine.take_screenshot()
+        self.view.alert_frame.add_alert("CV: Screenshot saved", INFO)
+
+    def cv_restart_video(self) -> None:
+        """Restart video from the beginning (v key)."""
+        if self.cv_engine is None or not hasattr(self.cv_engine, 'restart_video'):
+            return
+        self.cv_engine.restart_video()
+        self.view.alert_frame.add_alert("CV: Video restarted", INFO)
+
     def _neutralize_rat(self, rat_id: str):
         """Confirm a kill: log neutralized event, remove from engaged set, alert operator."""
         self.model.engaged_rats.discard(rat_id)
-        self.cv_engine.set_engaged(bool(self.model.engaged_rats))
+        if hasattr(self.cv_engine, 'set_engaged'):
+            self.cv_engine.set_engaged(bool(self.model.engaged_rats))
         self.model.neutralized_rats.add(rat_id)
         if self.model.pending_engage_rat_id == rat_id:
             self.model.pending_engage_rat_id = None
@@ -424,6 +497,22 @@ class FCPController:
 
     #===================================================================
 
+    def _send_hit_confirmation(self, rat_id: str) -> None:
+        """Notify the DNN that a RAT has been confirmed neutralized."""
+        msg = {
+            "msg_type": "hit_confirmed",
+            "rat_id": rat_id,
+            "current_time": time.strftime('%Y-%m-%dT%H:%M:%S'),
+        }
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(json.dumps(msg).encode('utf-8'), (self.dnn_send_ip, self.dnn_send_port))
+            sock.close()
+        except Exception as e:
+            print(f"Failed to send hit confirmation for {rat_id}: {e}")
+
+    #===================================================================
+
     def _send_detection_command(self, mode: str, enabled: bool):
         """Send a UDP JSON command to the DNN indicating a detection-mode change."""
         msg = {
@@ -439,20 +528,6 @@ class FCPController:
             sock.close()
         except Exception as e:
             print(f"Failed to send detection command for {mode}: {e}")
-
-    def _send_hit_confirmation(self, rat_id: str) -> None:
-        """Notify the DNN that a RAT has been confirmed neutralized."""
-        msg = {
-            "msg_type": "hit_confirmed",
-            "rat_id": rat_id,
-            "current_time": time.strftime('%Y-%m-%dT%H:%M:%S'),
-        }
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.sendto(json.dumps(msg).encode('utf-8'), (self.dnn_send_ip, self.dnn_send_port))
-            sock.close()
-        except Exception as e:
-            print(f"Failed to send hit confirmation for {rat_id}: {e}")
 
     #===================================================================
 
@@ -508,7 +583,8 @@ class FCPController:
         print(f"Engaged RAT: {rat_id}")
         self.model.analytics_db.log_rat_event(rat_id, 'engage_commanded')
         self.model.engaged_rats.add(rat_id)
-        self.cv_engine.set_engaged(True)
+        if self.cv_engine is not None and hasattr(self.cv_engine, 'set_engaged'):
+            self.cv_engine.set_engaged(True)
         rat = self.model.rats.get(rat_id)
         if rat:
             self._send_dne_targeting(rat, fire=1, state_command=2)
@@ -548,7 +624,8 @@ class FCPController:
             return
         was_engaged = pid in self.model.engaged_rats
         self.model.engaged_rats.discard(pid)
-        self.cv_engine.set_engaged(bool(self.model.engaged_rats))
+        if self.cv_engine is not None and hasattr(self.cv_engine, 'set_engaged'):
+            self.cv_engine.set_engaged(bool(self.model.engaged_rats))
         self.model.pending_engage_rat_id = None
         rat = self.model.rats.get(pid)
         if rat and rat.zone >= 2:
