@@ -1,0 +1,22 @@
+# Poetry virtualenv
+.venv/
+
+# Environment variables (build locally)
+.env
+
+# Windows Zone.Identifier metadata files
+*Zone.Identifier
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database files
+*.db
+fcp/data/
+
+# Big CV files
+fcp/cv/best.onnx
+*.onnx

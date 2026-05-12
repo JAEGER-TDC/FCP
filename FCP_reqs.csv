@@ -1,0 +1,67 @@
+JAEGER Requirements,,,,,,,
+Name,Derived,Text,Verify Method,Verification Event,Verification Approach,Objective Evidence,Verification Status
+[01] Customer Requirements,,,,,,,
+SOW-1 Protected Area Layout,"IDN-20 On Target Probability 
+IDN-32 Protected Area Operations
+IDN-30 Protected Area Geometry ",The protected area shall be organized into 3 simultaneously operating quarter-circular zones. Each zone shall extend outward from a common center point covering a ground area of 90 deg and an airspace altitude range of 0-15 m measured from ground level.,,,,,
+SOW-2 Zone Layout,"IDN-3 Outer Zone Detection Boundary
+IDN-4 Middle Zone Velocity Tracking 
+IDN-5 Engagement Activation
+IDN-20 On Target Probability 
+IDN-29 Middle Zone Positional Tracking","The zones in the protected area shall be an outer zone with a radius of 85 m for detection, a middle zone with a radius of 60 m for tracking, and a central zone with a radius of 30 m for engagement.",,,,,
+SOW-3 Network Design,"IDN-7 Network Coverage
+IDN-1 Minimum Operational Coverage","The Ground-Based Defense Network shall be composed of a distributed set of nodes providing total coverage of the protected area. At least one mode is expected of being used at all times in each zone. Each mode shall be capable of operating independently of the others, while also cooperating together when multiple sensors are active",,,,,
+SOW-4 Field Data Relay,"IDN-6 Operational Data Interface
+IDN-50 Detecting Data",The Ground-Based Defense Network shall relay field data back to the forward command post for real-time visualization and mission-processing.,,,,,
+SOW-5 Detection Modes,"IDN-13 Modes of Detection
+IDN-2 Zone Detection Capability","The Ground-Based Defense Network shall be capable of supporting multiple detection modes within each zone of the network during operations -including optical, passive RF, acoustic, and ultrasonic.",,,,,
+SOW-6 Detection Mode Selection,"IDN-18 Command Interface
+IDN-40 Mode Commanding",The Ground-Based Defense Network shall be able to receive commands from the forward command post to update detection modes being used within each zone of the protected area.,,,,,
+SOW-7 Detecting Targets,"IDN-21 Detecting Reporting
+IDN-50 Detecting Data","The Ground-Based Defense Network shall report the latitude, longitude, and altitude (LLA) coordinates of any singular rogue aerial target moving below 5 m/s that enters the outer zone of the protected area back to the forward command post.",,,,,
+SOW-8 Tracking Targets,"IDN-9 Zone Reporting
+IDN-4 Middle Zone Velocity Tracking 
+IDN-31 Engagement Completion
+IDN-29 Middle Zone Positional Tracking
+IDN-47 State Vector Data
+IDN-49 State Vector Initial Data
+IDN-33 Trajectory Calculation","The Ground‑Based Defense Network shall determine the zone (outer, middle, or central) of any singular rogue aerial target that is moving at ≤ 1 m/s, with a positional accuracy of ± 5 meters, and shall transmit this zone‑membership information to the Forward Command Post within 2 s of detection.",,,,,
+SOW-9 Engaging Targets,"IDN-20 On Target Probability 
+IDN-16 Engagement Success
+IDN-39 System Time Synchronization
+IDN-51 Motor Positioning Data",The Ground-Based Defense Network shall demonstrate a visual confirmation that an engagement was executed against any rogue aerial target moving at a speed below 3 m/s that enters the central zone.,,,,,
+SOW-10 Engagement Safety,IDN-8 Engagement Restriction,The Ground-Based Defense Network shall conduct the engagement in a way that’s incapable of causing bodily injury or damage to any non-rogue aerial targets.,,,,,
+SOW-11 Primary Power,"IDN-17 Primary Power
+FCP-11  Operational Power
+IDN-45 Power Source
+IDN-44 Power Distribution",The Ground-Based Defense Network shall operate on single phase 120 VAC 60 Hz electrical power or be self-powered for the duration of the mission.,,,,,
+SOW-12 Backup Power,IDN-12 Backup Power,The Ground-Based Defense Network shall demonstrate the ability of solar energy as an alternative remote power source.,,,,,
+SOW-13 Airframe,,Roque Aerial Targets shall be rotor-propelled aircraft capable of stable flight within the enclosed protected area.,,,,,
+SOW-14 Endurance,,Roque Aerial Targets shall be capable of a minimum continuous flight time of 10 minutes under nominal payload and environmental conditions.,,,,,
+SOW-15 Power,,Roque Aerial Targets shall be self-powered for the duration of the mission.,,,,,
+SOW-16 Maintainability,,Roque Aerial Targets shall allow field replacement of propellers and batteries within 10 minutes by a trained operator.,,,,,
+SOW-17 Safety & FAA Compliance,,Roque Aerial Targets shall comply with FAA Part 107 small UAS requirements.,,,,,
+SOW-18 Real-Time Video Feed,"FCP-1 Video Display
+IDN-34 Real Time Video Feed
+IDN-48 Operator Interface",The Forward Command Post Shall be capable of displaying a video stream (at least 30 FPS) of targets being detected and tracked by the Ground-Based Defense Network.,,,,,
+SOW-19 Computer Based Visualization,"FCP-2 Computer Visualization
+FCP-3 Tracking Confidence Levels
+IDN-37 Computer Visualization",The Forward Operating Command Post shall use computer vision to display real-time (at least 30 FPS) target tracking confidence levels during mission operations.,,,,,
+SOW-20 F2T2EA Analysis,"FCP-5 F2T2EA Post Mission Analysis
+FCP-4 F2T2EA Analysis
+IDN-36 F2T2EA Event Analysis
+IDN-38 F2T2EA Analysis Display
+IDN-48 Operator Interface
+IDN-52 Data Storage","The Forward Command Post shall display an analysis of F2T2EA events and their rates, durations, and losses for each target, and display the following performance metrics post mission-operations: identification accuracy and engagement success rates, sensor mode usages and durations, and the average time from detection to engagement for each target.",,,,,
+SOW-21 Node Network Status,"FCP-8 Operational Data Visualization
+IDN-35 Oprational Data Reporting
+IDN-43 State of Health Data Interface","The Forward Command Post shall display a low-fidelity network map showing the health, status, engagement area, rough location of nodes in the engagement area, forward command post, and network links of the nodes in the Ground-Based Defense Network at a maximum latency of 1000 milliseconds.",,,,,
+SOW-22 Alerts & Notifications,"IDN-11 Health And Status Reporting
+IDN-43 State of Health Data Interface","The Forward Command Post shall give the user alerts that indicate fault or failure, and notifications are information or change in state/status of the system for node network for issues related to signal and power levels at a maximum latency of 5000 milliseconds.",,,,,
+SOW-23 Power,FCP-11  Operational Power,The Forward Command Post shall operate on single phase 120 VAC 60 Hz electrical power or be self-powered for the duration of the mission.,,,,,
+SOW-24 Ground-Based Defense Network Commanding,"IDN-19 Secured Communication
+IDN-46 Logical Commands",The Forward Command Post shall be capable of sending commands to the Ground-Based Defense Network over secure communications links.,,,,,
+SOW-25 Electrical Discharge,"IDN-14 ESD Grounding
+IDN-10 ESD Insulation",All hardware delivered or used by the contractor shall prevent electrical discharge to system handlers and be compliant with MIL-STD-1472G Section 5.7.,,,,,
+SOW-26 Safety Inspection,IDN-22 Electrical Shock Warning,All hardware or processes used by the contractor shall pass a customer safety inspection on demonstration day prior to mission execution.,,,,,
+SOW-27 Safety Labels,IDN-15 Panel/ Cover/ Connector Warning,"All hardware shall possess safety labels and markings per MIL-STD-1472G Section 5.7, display of warnings and hazards.",,,,,
