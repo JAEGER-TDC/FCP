@@ -31,3 +31,12 @@ class CVEngineBase:
         engine derives on_target from actual gimbal sensor data, so this is a
         deliberate no-op — calling it has no effect and cannot fabricate events.
         """
+
+    def get_raw_frame(self) -> "np.ndarray | None":
+        """Return the most recent raw (pre-annotation) frame, or None.
+
+        Used by HitConfirmEngine to analyse the drone body without HUD
+        artefacts (crosshairs, lock rings, etc.) causing false positives.
+        Subclasses that separate raw from annotated frames should override this.
+        """
+        return None

@@ -39,13 +39,18 @@ class FCPView(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
 
         self._v_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._v_splitter.setChildrenCollapsible(False)
         outer.addWidget(self._v_splitter)
 
         self._top_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._top_splitter.setChildrenCollapsible(False)
+        self._top_splitter.setMinimumHeight(180)
         self._v_splitter.addWidget(self._top_splitter)
         self._v_splitter.setStretchFactor(0, 2)
 
         self._bot_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._bot_splitter.setChildrenCollapsible(False)
+        self._bot_splitter.setMinimumHeight(180)
         self._v_splitter.addWidget(self._bot_splitter)
         self._v_splitter.setStretchFactor(1, 2)
 
@@ -53,6 +58,7 @@ class FCPView(QWidget):
         self.video_frame = video_frame.VideoFrame(self._top_splitter)
         self._top_splitter.addWidget(self.video_frame)
         self._top_splitter.setStretchFactor(0, 2)
+        self.video_frame.set_config_path(config_path)
         # CV engine started by CVLaunchDialog after mode selection — not auto-started here
 
         self.map_frame = map_frame.MapFrame(self._top_splitter)
@@ -99,7 +105,9 @@ class FCPView(QWidget):
         def _frac(splitter: QSplitter) -> float:
             sizes = splitter.sizes()
             total = sum(sizes)
-            return sizes[0] / total if total > 0 else 0.5
+            raw = sizes[0] / total if total > 0 else 0.5
+            # Clamp before saving so extreme drag positions never persist
+            return max(0.30, min(0.70, raw))
 
         config = configparser.ConfigParser()
         config.read(self._config_path)
@@ -125,6 +133,10 @@ class FCPView(QWidget):
         def _apply(splitter: QSplitter, frac: float | None):
             if frac is None:
                 return
+            # If saved fraction is outside a fair range, reset to equal split.
+            # This prevents the top/bottom row from being squished on reload.
+            if not (0.30 <= frac <= 0.70):
+                frac = 0.5
             total = sum(splitter.sizes())
             if total > 10:
                 a = int(frac * total)

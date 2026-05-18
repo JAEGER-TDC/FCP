@@ -3,30 +3,34 @@ CVTuningPanel — floating window for live CV engine parameter tuning.
 Opened by the gear button on the video frame.
 """
 
+import configparser
+
 from PyQt6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QLabel, QCheckBox, QDoubleSpinBox, QSpinBox,
-    QScrollArea, QGroupBox, QGridLayout, QSizePolicy,
+    QScrollArea, QGroupBox, QGridLayout, QSizePolicy, QPushButton,
 )
 from PyQt6.QtCore import Qt
 
-_BG    = '#1a1a2e'
-_FG    = '#e0e0e0'
-_SECH  = '#7ec8e3'
-_ENTRY = '#16213e'
-_DIM   = '#555566'
+# Light mode — readable in direct sunlight outdoors
+_BG    = '#F0F0F0'
+_FG    = '#212121'
+_SECH  = '#1565C0'
+_ENTRY = '#FFFFFF'
+_DIM   = '#757575'
+_DIV   = '#CCCCCC'
 
 _LABEL_SS = f'color:{_FG}; font-size:9pt;'
 _HINT_SS  = f'color:{_DIM}; font-size:8pt; font-style:italic;'
 _GB_SS    = (f'QGroupBox {{ color:{_SECH}; font-size:9pt; font-weight:bold;'
-             f' border:1px solid #30363d; border-radius:4px; margin-top:6px; padding-top:4px; }}'
+             f' border:1px solid {_DIV}; border-radius:4px; margin-top:8px; padding-top:6px; }}'
              f' QGroupBox::title {{ subcontrol-origin:margin; left:8px; }}')
 _SB_SS    = (f'QDoubleSpinBox, QSpinBox {{ background:{_ENTRY}; color:{_FG};'
-             f' border:1px solid #30363d; padding:1px 4px; font:9pt Courier; }}'
+             f' border:1px solid {_DIV}; padding:2px 4px; font:9pt Courier; }}'
              f' QDoubleSpinBox::up-button, QSpinBox::up-button,'
              f' QDoubleSpinBox::down-button, QSpinBox::down-button'
-             f' {{ background:#0f3460; width:16px; }}')
-_CB_SS    = f'QCheckBox {{ color:{_FG}; font-size:9pt; }} QCheckBox::indicator {{ width:13px; height:13px; }}'
+             f' {{ background:#E3EEFF; width:16px; }}')
+_CB_SS    = f'QCheckBox {{ color:{_FG}; font-size:9pt; }} QCheckBox::indicator {{ width:14px; height:14px; }}'
 
 _LABELS: dict = {
     'CONF_ACQUIRE':           ('Conf Acquire',      '{:.3f}'),
@@ -82,16 +86,23 @@ def _scroll_wrap(inner: QWidget) -> QScrollArea:
 class CVTuningPanel(QDialog):
     """Live-tuning panel for CVEngine/CVEngineSimulator config fields."""
 
-    def __init__(self, parent, engine, alert_cb=None):
+    def __init__(self, parent, engine, alert_cb=None, config_path=None):
         super().__init__(parent)
-        self._engine   = engine
-        self._alert_cb = alert_cb
+        self._engine      = engine
+        self._alert_cb    = alert_cb
+        self._config_path = config_path
         self._controls: dict[str, QWidget] = {}
 
         self.setWindowTitle('CV Engine Tuning')
         self.setModal(False)
-        self.resize(360, 520)
-        self.setStyleSheet(f'QDialog {{ background:{_BG}; }} QLabel {{ color:{_FG}; }}')
+        self.resize(370, 540)
+        self.setStyleSheet(
+            f'QDialog {{ background:{_BG}; }}'
+            f' QLabel {{ color:{_FG}; }}'
+            f' QPushButton {{ background:{_ENTRY}; color:{_FG}; border:1px solid {_DIV};'
+            f'   padding:4px 10px; font:9pt; border-radius:3px; }}'
+            f' QPushButton:hover {{ background:#E3EEFF; }}'
+        )
         self._build_ui()
         self.raise_()
 
@@ -117,6 +128,24 @@ class CVTuningPanel(QDialog):
                 setattr(cfg, attr, value)
         if self._alert_cb is not None:
             self._alert_cb(_format_alert(attr, value))
+        self._save_tuning()
+
+    def _save_tuning(self) -> None:
+        if not self._config_path:
+            return
+        cfg = self._cfg()
+        if cfg is None:
+            return
+        parser = configparser.ConfigParser()
+        parser.read(self._config_path)
+        if not parser.has_section('cv.tuning'):
+            parser.add_section('cv.tuning')
+        for attr in _LABELS:
+            val = getattr(cfg, attr, None)
+            if val is not None:
+                parser['cv.tuning'][attr.lower()] = str(val)
+        with open(self._config_path, 'w') as f:
+            parser.write(f)
 
     def _make_dsb(self, attr: str, min_: float, max_: float,
                   decimals: int, step: float) -> QDoubleSpinBox:
@@ -181,9 +210,9 @@ class CVTuningPanel(QDialog):
 
         nb = QTabWidget()
         nb.setStyleSheet(
-            f'QTabWidget::pane {{ background:{_BG}; border:1px solid #30363d; }}'
-            f' QTabBar::tab {{ background:#0f3460; color:{_FG}; padding:4px 12px; font-size:9pt; }}'
-            f' QTabBar::tab:selected {{ background:{_BG}; color:{_SECH}; }}'
+            f'QTabWidget::pane {{ background:{_BG}; border:1px solid {_DIV}; }}'
+            f' QTabBar::tab {{ background:#E3EEFF; color:{_FG}; padding:5px 14px; font-size:9pt; }}'
+            f' QTabBar::tab:selected {{ background:{_BG}; color:{_SECH}; font-weight:bold; }}'
         )
         root.addWidget(nb)
 
@@ -191,27 +220,32 @@ class CVTuningPanel(QDialog):
         nb.addTab(_scroll_wrap(self._build_dark_search_tab()), 'Dark Search')
         nb.addTab(_scroll_wrap(self._build_display_tab()), 'Display')
 
+        # Restore Defaults button at the bottom
+        _restore_btn = QPushButton('↺  Restore Defaults')
+        _restore_btn.clicked.connect(self._restore_defaults)
+        root.addWidget(_restore_btn)
+
     def _build_tracking_tab(self) -> QWidget:
         outer = QWidget()
         outer.setStyleSheet(f'background:{_BG};')
         vbox = QVBoxLayout(outer)
-        vbox.setSpacing(8)
-        vbox.setContentsMargins(8, 8, 8, 8)
+        vbox.setSpacing(10)
+        vbox.setContentsMargins(10, 10, 10, 10)
 
         gb, fl = self._gb('Confidence Thresholds')
-        self._row(fl, 'Acquire', self._make_dsb('CONF_ACQUIRE', 0.05, 0.50, 3, 0.01))
-        self._row(fl, 'Hold',    self._make_dsb('CONF_HOLD',    0.02, 0.20, 3, 0.005))
-        self._row(fl, 'Hint',    self._make_dsb('CONF_HINT',    0.01, 0.10, 3, 0.005))
+        self._row(fl, 'Acquire', self._make_dsb('CONF_ACQUIRE', 0.01, 0.99, 3, 0.01))
+        self._row(fl, 'Hold',    self._make_dsb('CONF_HOLD',    0.01, 0.99, 3, 0.005))
+        self._row(fl, 'Hint',    self._make_dsb('CONF_HINT',    0.001, 0.50, 3, 0.005))
         fl.addRow(self._hint('Acquire: lock-on threshold  |  Hold: stay-locked threshold'))
         vbox.addWidget(gb)
 
         gb2, fl2 = self._gb('Kalman Filter (PREDICTING mode)')
         fl2.addRow(self._make_check('KALMAN_ENABLED', 'Enabled'))
-        self._row(fl2, 'Max lost frames', self._make_sb('max_lost_frames', 5, 300, 5))
+        self._row(fl2, 'Max lost frames', self._make_sb('max_lost_frames', 1, 1000, 5))
         vbox.addWidget(gb2)
 
         gb3, fl3 = self._gb('Engagement')
-        self._row(fl3, 'Lock radius (px)', self._make_sb('ENGAGE_RADIUS_PX', 10, 120, 5))
+        self._row(fl3, 'Lock radius (px)', self._make_sb('ENGAGE_RADIUS_PX', 1, 500, 5))
         fl3.addRow(self._hint('Gimbal error must be < this for on_target=True'))
         vbox.addWidget(gb3)
 
@@ -222,22 +256,22 @@ class CVTuningPanel(QDialog):
         outer = QWidget()
         outer.setStyleSheet(f'background:{_BG};')
         vbox = QVBoxLayout(outer)
-        vbox.setSpacing(8)
-        vbox.setContentsMargins(8, 8, 8, 8)
+        vbox.setSpacing(10)
+        vbox.setContentsMargins(10, 10, 10, 10)
 
         gb, fl = self._gb('Dark-Pixel Search')
         fl.addRow(self._make_check('DARK_SEARCH_ENABLED', 'Enabled'))
         fl.addRow(self._make_check('DARK_COLOR_CHECK', 'Blue-sky color ring filter (disable if overcast)'))
-        self._row(fl, 'Pixel ratio',    self._make_dsb('DARK_PIXEL_RATIO', 0.30, 0.80, 2, 0.01))
+        self._row(fl, 'Pixel ratio',    self._make_dsb('DARK_PIXEL_RATIO', 0.05, 1.00, 2, 0.01))
         fl.addRow(self._hint('Blob < sky × ratio  |  lower = only very dark blobs'))
-        self._row(fl, 'Min area (px²)', self._make_sb('DARK_MIN_AREA', 10, 10000, 50))
-        fl.addRow(self._hint('∸30ft drone ≈ 500–3000px²   ≈100ft ≈ 30–150px²'))
-        self._row(fl, 'Max area (px²)', self._make_sb('DARK_MAX_AREA', 1000, 100000, 500))
-        self._row(fl, 'Search radius',  self._make_sb('DARK_SEARCH_RADIUS', 50, 600, 10))
-        fl.addRow(self._hint('Raise for fast-moving drones'))
-        self._row(fl, 'Grace frames',   self._make_sb('DARK_GRACE_FRAMES', 2, 30, 1))
+        self._row(fl, 'Min area (px²)', self._make_sb('DARK_MIN_AREA', 1, 50000, 10))
+        fl.addRow(self._hint('At 640×480: drone ≈ 50–500px²  |  At 1080p: 500–3000px²'))
+        self._row(fl, 'Max area (px²)', self._make_sb('DARK_MAX_AREA', 100, 500000, 100))
+        self._row(fl, 'Search radius',  self._make_sb('DARK_SEARCH_RADIUS', 10, 2000, 10))
+        fl.addRow(self._hint('At 640×480 keep ≤200 to avoid background false-locks'))
+        self._row(fl, 'Grace frames',   self._make_sb('DARK_GRACE_FRAMES', 0, 100, 1))
         fl.addRow(self._hint('Hold DARK LOCK through brief misses'))
-        self._row(fl, 'Conf timeout',   self._make_sb('DARK_LOCK_CONF_TIMEOUT', 5, 60, 1))
+        self._row(fl, 'Conf timeout',   self._make_sb('DARK_LOCK_CONF_TIMEOUT', 1, 200, 1))
         fl.addRow(self._hint('Release false-lock if CV gives no signal'))
         vbox.addWidget(gb)
 
@@ -248,20 +282,20 @@ class CVTuningPanel(QDialog):
         outer = QWidget()
         outer.setStyleSheet(f'background:{_BG};')
         vbox = QVBoxLayout(outer)
-        vbox.setSpacing(8)
-        vbox.setContentsMargins(8, 8, 8, 8)
+        vbox.setSpacing(10)
+        vbox.setContentsMargins(10, 10, 10, 10)
 
         gb, fl = self._gb('Position Smoothing (One-Euro Filter)')
-        self._row(fl, 'Min cutoff', self._make_dsb('oef_min_cutoff', 0.01, 0.20, 4, 0.005))
-        self._row(fl, 'Beta',       self._make_dsb('oef_beta', 0.0001, 0.01, 5, 0.0001))
+        self._row(fl, 'Min cutoff', self._make_dsb('oef_min_cutoff', 0.001, 2.0,  4, 0.005))
+        self._row(fl, 'Beta',       self._make_dsb('oef_beta',       0.00001, 0.10, 5, 0.0001))
         fl.addRow(self._hint('Smoothing resets the filter — brief jump is normal'))
         vbox.addWidget(gb)
 
         gb2 = QGroupBox('HUD Overlays')
         gb2.setStyleSheet(_GB_SS)
         grid = QGridLayout(gb2)
-        grid.setSpacing(4)
-        grid.setContentsMargins(8, 12, 8, 6)
+        grid.setSpacing(6)
+        grid.setContentsMargins(10, 14, 10, 8)
         toggles = [
             ('SHOW_HUD_PANEL',      'HUD info panel'),
             ('SHOW_FPS',            'FPS counter'),
@@ -300,3 +334,24 @@ class CVTuningPanel(QDialog):
             elif isinstance(widget, QSpinBox):
                 widget.setValue(int(val))
             widget.blockSignals(False)
+
+    def _restore_defaults(self) -> None:
+        """Reset all tunable fields to factory defaults and save."""
+        from cv.cv_draw import Config as _Cfg
+        defaults = _Cfg()
+        cfg = self._cfg()
+        if cfg is None:
+            return
+        for attr in _LABELS:
+            default_val = getattr(defaults, attr, None)
+            if default_val is None:
+                continue
+            # Apply to live engine
+            if hasattr(self._engine, 'update_config'):
+                self._engine.update_config(attr, default_val)
+            else:
+                setattr(cfg, attr, default_val)
+        # Refresh UI widgets to show new values
+        self._refresh_values()
+        # Persist to config.ini
+        self._save_tuning()

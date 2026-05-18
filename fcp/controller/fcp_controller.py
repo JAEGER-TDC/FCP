@@ -14,6 +14,7 @@ from protocol.dne_target import Target, PacketReceiver, make_packet
 from view.frames.alert_frame import INFO, WARNING, ERROR
 from cv.cv_engine import CVEngine
 from cv.cv_engine_sim import CVEngineSimulator
+from cv.hit_confirm import HitConfirmEngine
 
 
 class FCPController:
@@ -43,8 +44,11 @@ class FCPController:
         self._ser_lock = threading.Lock()
 
         # CV engine — set by start_mode_* after CVLaunchDialog selection
-        self.cv_engine = None
+        self.cv_engine   = None
+        self._cv_cfg_path = os.path.join(os.path.dirname(__file__), '..', 'cfg', 'config.ini')
 
+        # Hit confirmation — active while a RAT is engaged
+        self._hit_confirm: HitConfirmEngine | None = None
 
         # Per-RAT accumulated on-target dwell seconds; reset when off-target or lock lost
         self._engage_dwell: dict[str, float] = {}
@@ -364,6 +368,7 @@ class FCPController:
         self.model.cv_state       = new_state
         self.model.cv_confidence  = meta['confidence']
         self.view.video_frame.update_cv_status(new_state, meta['confidence'])
+        self.view.video_frame.update_hud_data(meta)
         self.model.cv_centroid    = (meta['cx'], meta['cy'])
         self.model.cv_frame_size  = (meta['frame_w'], meta['frame_h'])
         self.model.cv_last_update = time.time()
@@ -389,29 +394,79 @@ class FCPController:
             else:
                 self._engage_dwell[rat_id] = 0.0   # reset if off-target or lock lost
 
+        # Visual hit confirmation: scan raw frame for green laser dot on drone body
+        if self._hit_confirm is not None and self.model.engaged_rats:
+            raw_frame = self.cv_engine.get_raw_frame()
+            if raw_frame is not None and new_state in ('LOCKED', 'DARK LOCK'):
+                confirmed, conf = self._hit_confirm.update(
+                    raw_frame,
+                    meta['cx'], meta['cy'],
+                    meta.get('bbox_w', 0), meta.get('bbox_h', 0),
+                )
+                if confirmed:
+                    rat_id = next(iter(self.model.engaged_rats), 'UNK')
+                    self.view.alert_frame.add_alert(
+                        f'HIT CONFIRMED — green laser detected on RAT-{rat_id} (conf {conf:.2f})',
+                        ERROR)
+                    self.model.analytics_db.log_rat_event(
+                        rat_id, 'hit_visual_confirmed', confidence=conf)
+                    self._hit_confirm.reset()   # reset so it can re-confirm on next hit
+            elif new_state == 'SEARCHING':
+                self._hit_confirm.reset()
+
         self.view.after(100, self._poll_cv_state)   # reschedule
 
     # ── CV mode entry points (called by CVLaunchDialog and Load Video button) ──
 
+    def _load_cv_tuning(self, cfg) -> None:
+        """Apply any saved [cv.tuning] values from config.ini onto cfg."""
+        import configparser as _cp
+        parser = _cp.ConfigParser()
+        parser.read(self._cv_cfg_path)
+        if not parser.has_section('cv.tuning'):
+            return
+        sect = parser['cv.tuning']
+        for key, raw in sect.items():
+            attr = next((a for a in dir(cfg) if a.lower() == key), None)
+            if attr is None or attr.startswith('_'):
+                continue
+            current = getattr(cfg, attr)
+            try:
+                if isinstance(current, bool):
+                    setattr(cfg, attr, raw.lower() in ('true', '1', 'yes'))
+                elif isinstance(current, float):
+                    setattr(cfg, attr, float(raw))
+                elif isinstance(current, int):
+                    setattr(cfg, attr, int(raw))
+            except (ValueError, TypeError):
+                pass
+
     def start_mode_simulator(self) -> None:
         """Scripted oval-track simulator — no GPU needed."""
+        from cv.cv_draw import Config as DrawConfig
         _video = os.path.join(os.path.dirname(__file__), '..', 'assets', 'RAT-CV-1.mp4')
         if self.cv_engine is not None:
             self.cv_engine.stop()
-        self.cv_engine = CVEngineSimulator(video_path=_video)
+        cfg = DrawConfig()
+        self._load_cv_tuning(cfg)
+        self.cv_engine = CVEngineSimulator(video_path=_video, cfg=cfg)
         self.view.video_frame.play_cv_engine(self.cv_engine)
 
     def start_mode_video(self, path: str) -> None:
         """Real CV (TensorRT) on a video file."""
+        from cv.cv_draw import Config as DrawConfig
         if self.cv_engine is not None:
             self.cv_engine.stop()
-        self.cv_engine = CVEngine(video_path=path)
+        cfg = DrawConfig()
+        self._load_cv_tuning(cfg)
+        self.cv_engine = CVEngine(video_path=path, cfg=cfg)
         self.view.video_frame.play_cv_engine(self.cv_engine)
 
     def start_mode_camera(self, camera_index: int = 0) -> None:
         """Real CV (TensorRT) on a live USB camera feed."""
         from cv.cv_draw import Config as DrawConfig
         cfg = DrawConfig(USE_LIVE_CAMERA=True, CAMERA_INDEX=camera_index)
+        self._load_cv_tuning(cfg)
         if self.cv_engine is not None:
             self.cv_engine.stop()
         self.cv_engine = CVEngine(video_path=None, cfg=cfg)
@@ -459,6 +514,7 @@ class FCPController:
         if self.model.pending_engage_rat_id == rat_id:
             self.model.pending_engage_rat_id = None
         self._engage_dwell.pop(rat_id, None)
+        self._hit_confirm = None
         self._send_hit_confirmation(rat_id)
         self.model.analytics_db.log_rat_event(rat_id, 'neutralized')
         self.view.alert_frame.add_alert(f'RAT {rat_id} NEUTRALIZED', INFO)
@@ -581,6 +637,7 @@ class FCPController:
     def engage_rat(self, rat_id: str):
         """Engage a specific RAT — log to DB and send fire command to DNE."""
         print(f"Engaged RAT: {rat_id}")
+        self._hit_confirm = HitConfirmEngine()
         self.model.analytics_db.log_rat_event(rat_id, 'engage_commanded')
         self.model.engaged_rats.add(rat_id)
         if self.cv_engine is not None and hasattr(self.cv_engine, 'set_engaged'):
@@ -624,6 +681,7 @@ class FCPController:
             return
         was_engaged = pid in self.model.engaged_rats
         self.model.engaged_rats.discard(pid)
+        self._hit_confirm = None
         if self.cv_engine is not None and hasattr(self.cv_engine, 'set_engaged'):
             self.cv_engine.set_engaged(bool(self.model.engaged_rats))
         self.model.pending_engage_rat_id = None

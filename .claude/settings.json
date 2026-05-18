@@ -25,7 +25,18 @@
       "Bash(lsmod)",
       "Bash(modinfo uvcvideo *)",
       "Bash(sudo dmesg)",
-      "Bash(dmesg)"
+      "Bash(dmesg)",
+      "Bash(git -C /home/lockheed/FCP branch -a)",
+      "Bash(git -C /home/lockheed/FCP remote -v)",
+      "Bash(git -C /home/lockheed/FCP status)",
+      "Bash(git -C /home/lockheed/FCP checkout main)",
+      "Bash(git -C /home/lockheed/FCP restore .)",
+      "Bash(git -C /home/lockheed/FCP pull origin main)",
+      "Bash(git -C /home/lockheed/FCP branch -D DustinEdits)",
+      "Bash(git -C /home/lockheed/FCP checkout -b DustinEdits)",
+      "Bash(xargs cat)",
+      "Bash(python -c \"import sys; sys.path.insert\\(0,'fcp'\\); from cv.hit_confirm import HitConfirmEngine, HitConfirmConfig; print\\('hit_confirm OK'\\)\")",
+      "Bash(python3 -c \"import tensorrt\")"
     ],
     "additionalDirectories": [
       "/home/lockheed/.claude/plans"
