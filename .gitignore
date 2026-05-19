@@ -22,3 +22,6 @@ fcp/cv/best.onnx
 *.onnx
 *.pt
 *.engine
+
+# Video Files
+*.mp4

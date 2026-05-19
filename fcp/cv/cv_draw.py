@@ -74,8 +74,8 @@ class Config:
     ENGAGE_RADIUS_PX:   int   = 40
 
     # ── HUD overlay toggles ───────────────────────────────────────
-    SHOW_HUD_PANEL:     bool  = True
-    SHOW_FPS:           bool  = True
+    SHOW_HUD_PANEL:     bool  = False
+    SHOW_FPS:           bool  = False
     SHOW_CROSSHAIR:     bool  = True
     SHOW_LOCK_RING:     bool  = True
     SHOW_LASER_CENTER:  bool  = True
@@ -86,9 +86,9 @@ class Config:
     # ── Visual extras ─────────────────────────────────────────────
     SHOW_TRAIL:         bool  = True
     TRAIL_LENGTH:       int   = 60
-    SHOW_ZOOM_INSET:    bool  = True
-    ZOOM_INSET_SIZE:    int   = 220
-    ZOOM_MAGNIFY:       int   = 4
+    SHOW_ZOOM_INSET:    bool  = False
+    ZOOM_INSET_SIZE:    int   = 160
+    ZOOM_MAGNIFY:       int   = 2
     SHOW_VELOCITY_ARROW: bool = True
 
 
@@ -111,7 +111,8 @@ def _scale_fns(frame):
     h, w = frame.shape[:2]
     s    = min(w / 1920.0, h / 1080.0)
     S    = lambda n: max(1, int(round(n * s)))
-    F    = lambda f: max(0.25, f * s)
+    # Floor font at 0.42 so text stays legible on low-res camera frames
+    F    = lambda f: max(0.42, f * s)
     lw   = max(1, int(round(s)))
     tw   = max(1, int(round(s * 1.5)))
     return S, F, lw, tw
@@ -133,13 +134,15 @@ def _draw_trail(show, trail, color):
 
 def _draw_zoom_inset(show, frame, cx, cy, cfg, border_color):
     """Magnified patch around drone in bottom-right corner."""
-    crop = max(4, cfg.ZOOM_INSET_SIZE // (2 * cfg.ZOOM_MAGNIFY))
+    sh, sw = show.shape[:2]
+    # Scale inset size proportionally — nominal size is for 1080p, scale down for smaller frames
+    iz   = max(80, int(cfg.ZOOM_INSET_SIZE * min(sh / 1080.0, sw / 1920.0)))
+    crop = max(4, iz // (2 * cfg.ZOOM_MAGNIFY))
     fh, fw = frame.shape[:2]
     x1 = max(0, cx - crop);  x2 = min(fw, cx + crop)
     y1 = max(0, cy - crop);  y2 = min(fh, cy + crop)
     if x2 <= x1 or y2 <= y1: return
     patch = frame[y1:y2, x1:x2]
-    iz    = cfg.ZOOM_INSET_SIZE
     inset = cv2.resize(patch, (iz, iz), interpolation=cv2.INTER_LINEAR)
     ic = iz // 2
     cv2.line(inset,   (ic - 18, ic), (ic + 18, ic), (0, 255, 255), 1, cv2.LINE_AA)
@@ -251,11 +254,11 @@ def _draw_hud(show, cx, cy, laser_x, laser_y,
                       (120, 120, 120)))
 
     fs     = F(0.65)
-    row_h  = S(26)
-    margin = S(10)
-    pad    = S(20)
-    pw     = S(460)
-    ph     = S(16) + len(lines) * row_h
+    row_h  = max(20, S(26))   # never less than 20px — prevents line overlap
+    margin = max(6, S(10))
+    pad    = max(10, S(20))
+    pw     = max(200, S(460))
+    ph     = max(20, S(16)) + len(lines) * row_h
 
     cv2.rectangle(show, (margin, margin), (margin+pw, margin+ph), (0,0,0), -1)
     cv2.rectangle(show, (margin, margin), (margin+pw, margin+ph), color, lw)

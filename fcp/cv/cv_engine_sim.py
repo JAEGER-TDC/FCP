@@ -62,6 +62,7 @@ class CVEngineSimulator:
             "state": "SEARCHING", "confidence": 0.0,
             "cx": 0, "cy": 0, "frame_w": 0, "frame_h": 0,
             "gimbal_err_px": 0.0, "on_target": False,
+            "bbox_w": 0, "bbox_h": 0,
         }
         self._meta_lock          = threading.Lock()
         self._stop_evt           = threading.Event()
@@ -115,6 +116,10 @@ class CVEngineSimulator:
 
     def restart_video(self) -> None:
         self._restart_video_evt.set()
+
+    def get_raw_frame(self) -> np.ndarray | None:
+        """The simulator doesn't separate raw from annotated; return last frame."""
+        return self._last_frame
 
     # ── Background thread ─────────────────────────────────────────
 

@@ -4,7 +4,7 @@ Presents 3 mutually exclusive CV operating modes.
 """
 
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QLabel, QPushButton, QFileDialog,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog, QSpinBox,
 )
 from PyQt6.QtCore import Qt
 
@@ -80,6 +80,25 @@ class CVLaunchDialog(QDialog):
             '#F57F17', self._pick_camera,
         ))
 
+        # Camera index row — shown below the USB card
+        _cam_row = QHBoxLayout()
+        _cam_lbl = QLabel('Camera index:')
+        _cam_lbl.setStyleSheet(f'color:{_DIM}; font:9pt Helvetica;')
+        self._cam_spin = QSpinBox()
+        self._cam_spin.setRange(0, 9)
+        self._cam_spin.setValue(0)   # USB camera attached via usbipd appears as /dev/video0
+        self._cam_spin.setFixedWidth(54)
+        self._cam_spin.setStyleSheet(
+            f'background:{_CARD}; color:{_FG}; border:1px solid {_DIV}; border-radius:3px;')
+        _cam_hint = QLabel('(0 = built-in, 1 = first USB)')
+        _cam_hint.setStyleSheet(f'color:{_DIM}; font:8pt Helvetica;')
+        _cam_row.addSpacing(8)
+        _cam_row.addWidget(_cam_lbl)
+        _cam_row.addWidget(self._cam_spin)
+        _cam_row.addWidget(_cam_hint)
+        _cam_row.addStretch()
+        root.addLayout(_cam_row)
+
         self._status = QLabel('')
         self._status.setStyleSheet('color:#C62828; font:9pt Helvetica;')
         self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -104,5 +123,5 @@ class CVLaunchDialog(QDialog):
 
     def _pick_camera(self):
         self._status.setText('Opening camera…')
-        self._controller.start_mode_camera()
+        self._controller.start_mode_camera(camera_index=self._cam_spin.value())
         self.accept()

@@ -1,8 +1,10 @@
 from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGroupBox, QTableWidget, QTableWidgetItem,
     QLabel, QPushButton, QWidget, QHeaderView, QAbstractItemView,
+    QTabWidget, QScrollArea, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QFont
 import csv
 import os
 from datetime import datetime
@@ -35,6 +37,12 @@ def _fmt_ts(iso_str: str | None) -> str:
         return iso_str
 
 
+_TABLE_ROW_H  = 26
+_TABLE_HDR_H  = 28
+_LABEL_FONT   = QFont()
+_LABEL_FONT.setPointSize(10)
+
+
 def _make_table(headers: list[str], max_rows: int) -> QTableWidget:
     table = QTableWidget(0, len(headers))
     table.setHorizontalHeaderLabels(headers)
@@ -42,11 +50,28 @@ def _make_table(headers: list[str], max_rows: int) -> QTableWidget:
     table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     table.setAlternatingRowColors(True)
-    table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    table.horizontalHeader().setFont(_LABEL_FONT)
     hdr = table.horizontalHeader()
     hdr.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-    table.setMaximumHeight(28 + max_rows * 30 + 4)  # header + rows + border
+    table.setMinimumHeight(_TABLE_HDR_H + max_rows * _TABLE_ROW_H)
+    table.setMaximumHeight(_TABLE_HDR_H + max_rows * _TABLE_ROW_H + 4)
     return table
+
+
+def _scroll_page(inner: QWidget) -> QScrollArea:
+    sa = QScrollArea()
+    sa.setWidgetResizable(True)
+    sa.setWidget(inner)
+    sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    return sa
+
+
+def _stat_label(text: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setFont(_LABEL_FONT)
+    lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    return lbl
 
 
 class AnalyticsFrame(BaseFrame):
@@ -79,83 +104,101 @@ class AnalyticsFrame(BaseFrame):
 
     def create_widgets(self):
         outer_layout = QVBoxLayout(self)
-        outer_layout.setContentsMargins(6, 6, 6, 6)
+        outer_layout.setContentsMargins(4, 4, 4, 4)
+        outer_layout.setSpacing(4)
 
-        outer = QGroupBox('Performance Analytics')
-        outer_layout.addWidget(outer)
-        vbox = QVBoxLayout(outer)
+        title = QLabel('Performance Analytics')
+        title.setFont(QFont('', 11, QFont.Weight.Bold))
+        outer_layout.addWidget(title)
 
-        # ---- Section A: Sensor Mode Usage ----------------------------
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        outer_layout.addWidget(tabs, 1)
+
+        # ── Tab 1: Targeting ──────────────────────────────────────────
+        t1_inner = QWidget()
+        t1_vbox  = QVBoxLayout(t1_inner)
+        t1_vbox.setContentsMargins(6, 6, 6, 6)
+        t1_vbox.setSpacing(8)
+
         sensor_group = QGroupBox('Sensor Mode Usage')
-        sensor_vbox = QVBoxLayout(sensor_group)
+        s_vbox = QVBoxLayout(sensor_group)
         self._sensor_table = _make_table(
             ['Sensor', 'Times Enabled', 'Total Duration', '% Mission Time'],
             max_rows=3,
         )
-        sensor_vbox.addWidget(self._sensor_table)
-        vbox.addWidget(sensor_group)
+        s_vbox.addWidget(self._sensor_table)
+        t1_vbox.addWidget(sensor_group)
 
-        # ---- Section B: Time to Detect / Engage ----------------------
-        t2e_group = QGroupBox('Time to Detect / Engage (per target)')
-        t2e_vbox = QVBoxLayout(t2e_group)
+        t2e_group = QGroupBox('Time to Detect / Engage  (per target)')
+        t2_vbox = QVBoxLayout(t2e_group)
         self._t2e_table = _make_table(
-            ['Target', 'First Detected', 'Reached Zone 3', 'Engage Cmd', 'Detect→Z3', 'Detect→Engage'],
-            max_rows=3,
+            ['Target', 'First Detected', 'Zone 3', 'Engage Cmd', 'Detect→Z3', 'Detect→Engage'],
+            max_rows=5,
         )
-        t2e_vbox.addWidget(self._t2e_table)
-        vbox.addWidget(t2e_group)
+        t2_vbox.addWidget(self._t2e_table)
+        t1_vbox.addWidget(t2e_group)
 
-        # ---- Section C: F2T2EA Event Rates & Durations ---------------
-        c_group = QGroupBox('F2T2EA Event Rates & Durations')
-        c_vbox = QVBoxLayout(c_group)
+        f_group = QGroupBox('F2T2EA Event Rates & Durations')
+        f_vbox = QVBoxLayout(f_group)
         self._f2t2ea_table = _make_table(
             ['Target', 'Detect→Z3', 'Z3→Engage', 'Engage→Neut', 'Total F2T2EA'],
-            max_rows=3,
+            max_rows=5,
         )
-        c_vbox.addWidget(self._f2t2ea_table)
-        vbox.addWidget(c_group)
+        f_vbox.addWidget(self._f2t2ea_table)
+        t1_vbox.addWidget(f_group)
 
-        # ---- Section D: Identification Accuracy ----------------------
+        t1_vbox.addStretch(1)
+        tabs.addTab(_scroll_page(t1_inner), 'Targeting')
+
+        # ── Tab 2: Results ────────────────────────────────────────────
+        t2_inner = QWidget()
+        t2_vbox2 = QVBoxLayout(t2_inner)
+        t2_vbox2.setContentsMargins(6, 6, 6, 6)
+        t2_vbox2.setSpacing(8)
+
         d_group = QGroupBox('Identification Accuracy')
-        d_vbox = QVBoxLayout(d_group)
-        self._id_conf_label  = QLabel('Avg CV Confidence (LOCKED):  ---')
-        self._id_count_label = QLabel('Lock samples this mission:    ---')
+        d_vbox  = QVBoxLayout(d_group)
+        d_vbox.setSpacing(6)
+        self._id_conf_label  = _stat_label('Avg CV Confidence (LOCKED):  ---')
+        self._id_count_label = _stat_label('Lock samples this mission:    ---')
         d_vbox.addWidget(self._id_conf_label)
         d_vbox.addWidget(self._id_count_label)
-        vbox.addWidget(d_group)
+        t2_vbox2.addWidget(d_group)
 
-        # ---- Section E: Engagement Success Rate ----------------------
         e_group = QGroupBox('Engagement Success Rate')
-        e_vbox = QVBoxLayout(e_group)
+        e_vbox  = QVBoxLayout(e_group)
         self._engage_table = _make_table(
             ['Target', 'Engagements', 'Hits', 'Success Rate'],
-            max_rows=3,
+            max_rows=5,
         )
         e_vbox.addWidget(self._engage_table)
-        vbox.addWidget(e_group)
+        t2_vbox2.addWidget(e_group)
 
-        # ---- Section F: Losses per Target ----------------------------
-        f_group = QGroupBox('Losses per Target')
-        f_vbox = QVBoxLayout(f_group)
+        l_group = QGroupBox('Losses per Target')
+        l_vbox  = QVBoxLayout(l_group)
         self._losses_table = _make_table(
             ['Target', 'Track Losses'],
-            max_rows=3,
+            max_rows=5,
         )
-        f_vbox.addWidget(self._losses_table)
-        vbox.addWidget(f_group)
+        l_vbox.addWidget(self._losses_table)
+        t2_vbox2.addWidget(l_group)
 
-        # ---- Buttons -------------------------------------------------
-        btn_widget = QWidget()
-        btn_layout = QHBoxLayout(btn_widget)
-        btn_layout.setContentsMargins(0, 0, 0, 0)
+        t2_vbox2.addStretch(1)
+        tabs.addTab(_scroll_page(t2_inner), 'Results')
+
+        # ── Buttons (always visible below tabs) ───────────────────────
+        btn_widget  = QWidget()
+        btn_layout  = QHBoxLayout(btn_widget)
+        btn_layout.setContentsMargins(0, 2, 0, 0)
         refresh_btn = QPushButton('Refresh')
         refresh_btn.clicked.connect(self.refresh)
-        export_btn = QPushButton('Export CSV')
+        export_btn  = QPushButton('Export CSV')
         export_btn.clicked.connect(self._export_csv)
         btn_layout.addWidget(refresh_btn)
         btn_layout.addWidget(export_btn)
         btn_layout.addStretch()
-        vbox.addWidget(btn_widget)
+        outer_layout.addWidget(btn_widget)
 
         self._schedule_refresh()
 

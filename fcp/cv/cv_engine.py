@@ -22,6 +22,55 @@ import cv2
 import numpy as np
 
 
+class _LiveCapture:
+    """
+    Dedicated capture thread for live cameras.
+
+    Reads frames as fast as the camera delivers them and always keeps only
+    the most recent one.  The TRT loop calls read() to get the freshest
+    frame instantly — no stale buffering, no lag accumulation.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture):
+        self._cap   = cap
+        self._frame: np.ndarray | None = None
+        self._lock  = threading.Lock()
+        self._stop  = threading.Event()
+        self._ready = threading.Event()
+        self._t     = threading.Thread(target=self._run, daemon=True,
+                                       name='LiveCapture')
+        self._t.start()
+
+    def read(self) -> np.ndarray | None:
+        with self._lock:
+            return None if self._frame is None else self._frame.copy()
+
+    def wait_first(self, timeout: float = 5.0) -> bool:
+        """Block until the first frame arrives or timeout. Returns True on success."""
+        return self._ready.wait(timeout)
+
+    def stop(self):
+        self._stop.set()
+        self._t.join(timeout=2.0)
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                ret, frame = self._cap.read()
+            except Exception:
+                # libjpeg can throw C++ exceptions through cap.read() on
+                # corrupt MJPG frames — catch everything to prevent abort
+                time.sleep(0.01)
+                continue
+            # Discard corrupt / zero-size frames
+            if not ret or frame is None or frame.size == 0:
+                time.sleep(0.005)
+                continue
+            with self._lock:
+                self._frame = frame
+            self._ready.set()
+
+
 class CVEngine:
     """Real TensorRT CV engine — same interface as CVEngineSimulator."""
 
@@ -34,6 +83,9 @@ class CVEngine:
             "cx": 0, "cy": 0,
             "frame_w": 0, "frame_h": 0,
             "gimbal_err_px": 0.0, "on_target": False,
+            "bbox_w": 0, "bbox_h": 0,
+            "fps": 0.0, "peak_ms": 0.0, "speed": 0.0,
+            "lost_frames": 0, "frame_num": 0,
         }
         self._lock               = threading.Lock()
         self._stop_event         = threading.Event()
@@ -43,6 +95,7 @@ class CVEngine:
         self._screenshot_request = threading.Event()
         self._paused             = False
         self._last_frame: np.ndarray | None = None
+        self._raw_frame:  np.ndarray | None = None   # pre-annotation frame for hit confirm
         self._thread: threading.Thread | None = None
         self._error: str | None = None
 
@@ -70,6 +123,10 @@ class CVEngine:
 
     def get_error(self) -> str | None:
         return self._error
+
+    def get_raw_frame(self) -> np.ndarray | None:
+        """Return the most recent raw (pre-annotation) frame, or None."""
+        return self._raw_frame
 
     def update_config(self, attr: str, value) -> None:
         """Mutate a Config field live — the tracking loop picks it up next frame.
@@ -136,10 +193,56 @@ class CVEngine:
         is_live = getattr(cfg, 'USE_LIVE_CAMERA', False)
         if is_live:
             cam_idx = getattr(cfg, 'CAMERA_INDEX', 0)
-            cap = cv2.VideoCapture(cam_idx)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            if not cap.isOpened():
-                self._error = f"Cannot open camera index {cam_idx}"
+            import os as _os
+            dev_path = f'/dev/video{cam_idx}'
+            if not _os.path.exists(dev_path):
+                self._error = (
+                    f"{dev_path} not found — camera not attached to WSL. "
+                    f"Run in PowerShell (Admin):  usbipd attach --wsl --busid <ID>")
+                return
+            # Try formats in order until frames actually arrive.
+            # Logitech BRIO and most modern USB cameras are MJPEG-primary;
+            # YUYV is added as fallback only.
+            _candidates = [
+                ('MJPG', 1280,  720, 30),
+                ('MJPG',  640,  480, 30),
+                ('MJPG',  640,  480, 60),
+                ('MJPG',  320,  240, 30),
+                ('YUYV',  640,  480, 15),
+                ('YUYV',  320,  240, 15),
+                (None,    640,  480, 30),   # let driver pick
+            ]
+            cap      = None
+            live_cap = None
+            for fourcc_str, w, h, fps in _candidates:
+                if cap is not None:
+                    cap.release()
+                cap = cv2.VideoCapture(cam_idx, cv2.CAP_V4L2)
+                if not cap.isOpened():
+                    self._error = f"Cannot open camera index {cam_idx}"
+                    return
+                if fourcc_str:
+                    cap.set(cv2.CAP_PROP_FOURCC,
+                            cv2.VideoWriter_fourcc(*fourcc_str))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                cap.set(cv2.CAP_PROP_FPS,          fps)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE,   4)
+                print(f'[CVEngine] trying {fourcc_str or "auto"} {w}x{h}@{fps}fps ...')
+                live_cap = _LiveCapture(cap)
+                if live_cap.wait_first(timeout=3.0):
+                    act_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    act_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    print(f'[CVEngine] camera OK: {fourcc_str or "auto"} '
+                          f'{act_w}x{act_h} @{fps}fps')
+                    break
+                print(f'[CVEngine] no frames — skipping')
+                live_cap.stop()
+                live_cap = None
+            else:
+                cap.release()
+                self._error = ("Camera opened but no frames received — "
+                               "check usbipd attach and /dev/video permissions")
                 return
         else:
             cap = cv2.VideoCapture(self._video_path)
@@ -174,6 +277,7 @@ class CVEngine:
         last_conf    = 0.0
         frame_num    = 0
         cx = cy      = 0
+        bbox_w = bbox_h = 0
         frame_times: list[float] = []
         dark_no_conf = 0
         dark_grace   = 999
@@ -208,7 +312,15 @@ class CVEngine:
                 cx = cy = 0; frame_num = 0
                 status, color = "SEARCHING", (0, 80, 255)
 
-            frame = reader.read()
+            if is_live:
+                # Always fetch the freshest frame from the capture thread.
+                # If nothing new has arrived yet, wait briefly and retry.
+                frame = live_cap.read()
+                if frame is None:
+                    self._stop_event.wait(0.005)
+                    continue
+            else:
+                frame = reader.read()
             if frame is None:
                 if is_live:
                     break
@@ -265,6 +377,8 @@ class CVEngine:
                 rx, ry = refine_to_dark_centroid(gray, rx, ry, bw_raw, bh_raw)
                 cx     = int(filter_x.apply(rx, dt))
                 cy     = int(filter_y.apply(ry, dt))
+                bbox_w = int(bw_raw)
+                bbox_h = int(bh_raw)
                 kalman.update(cx, cy, dt)
                 lost_frames = 0; last_conf = best_conf
                 dark_no_conf = 0; dark_grace = 999
@@ -300,6 +414,7 @@ class CVEngine:
             else:
                 filter_x.reset(); filter_y.reset(); kalman.reset()
                 dark_no_conf = 0; dark_grace = 999
+                bbox_w = bbox_h = 0
                 status, color = "SEARCHING", (0, 80, 255)
 
             vx, vy   = kalman.velocity()
@@ -309,6 +424,8 @@ class CVEngine:
             if len(frame_times) > 60:
                 frame_times.pop(0)
             peak_ms = max(frame_times)
+
+            self._raw_frame = frame  # snapshot before annotation — used by HitConfirmEngine
 
             show = cv2.resize(frame, (display_w, display_h)) if needs_resize else frame.copy()
             sx   = display_w / w
@@ -345,6 +462,10 @@ class CVEngine:
                     "cx": cx, "cy": cy,
                     "frame_w": w, "frame_h": h,
                     "gimbal_err_px": err, "on_target": on_target,
+                    "bbox_w": bbox_w, "bbox_h": bbox_h,
+                    "fps": avg_fps, "peak_ms": peak_ms,
+                    "speed": float((vx**2 + vy**2) ** 0.5),
+                    "lost_frames": lost_frames, "frame_num": frame_num,
                 }
 
             self._last_frame = show
@@ -373,5 +494,8 @@ class CVEngine:
             if sleep_s > 0:
                 self._stop_event.wait(sleep_s)
 
-        reader.stop()
+        if is_live:
+            live_cap.stop()
+        else:
+            reader.stop()
         cap.release()
