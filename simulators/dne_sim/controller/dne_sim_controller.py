@@ -5,7 +5,7 @@ import configparser
 
 from model.dne_sim_model import DNESimModel
 from view.dne_sim_view import DNESimView
-from protocol.dne_target import Target, PacketReceiver, make_packet
+from protocol.dne_target import Target, DNEHealth, PacketReceiver, make_health_packet
 
 
 class DNESimController:
@@ -49,6 +49,8 @@ class DNESimController:
                     if result is None:
                         continue
 
+                    if not isinstance(result, Target):
+                        continue
                     def _update(r=result):
                         self.model.az = r.azimuth
                         self.model.el = r.elevation
@@ -68,23 +70,19 @@ class DNESimController:
                         self.view.targeting_frame.update_targeting(
                             r.azimuth, r.elevation, r.range,
                             r.azimuth_d, r.elevation_d, r.range_d,
-                            r.fire, r.state)
+                            r.fire, r.state, r.hit_confirmation, r.time)
                         self.view.recv_data_frame.add_alert(
                             f"az={r.azimuth:.2f} el={r.elevation:.2f} range={r.range:.2f} "
                             f"azr={r.azimuth_d:.2f} elr={r.elevation_d:.2f} rngr={r.range_d:.2f} "
-                            f"fire={r.fire} state={r.state}"
+                            f"fire={r.fire} state={r.state} hit_conf={r.hit_confirmation}"
                         )
                     self.view.after(0, _update)
 
-                    # Echo back with laser_firing state substituted for fire;
+                    # Respond with health packet (matching real DNE hardware: no CRC, 2-byte payload);
                     # suppress response entirely when unhealthy (FCP infers DNE is down)
                     if self.model.am_i_healthy:
-                        echo = Target(
-                            result.azimuth, result.elevation, result.range,
-                            result.azimuth_d, result.elevation_d, result.range_d,
-                            int(self.model.laser_firing), result.state,
-                        )
-                        conn.sendall(make_packet(echo))
+                        health = DNEHealth(am_i_healthy=1, laser_firing=int(self.model.laser_firing))
+                        conn.sendall(make_health_packet(health))
 
             except Exception as e:
                 print(f"DNE sim connection error: {e}")

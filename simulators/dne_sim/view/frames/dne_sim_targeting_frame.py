@@ -14,6 +14,8 @@ class DNESimTargetingFrame(ttk.LabelFrame):
         self.range_rate = tk.DoubleVar(value=0.0)
         self.fire = tk.IntVar(value=0)
         self.state_command = tk.IntVar(value=0)
+        self.hit_confirmation = tk.IntVar(value=0)
+        self.time_us = tk.IntVar(value=0)
         self.create_widgets()
 
     def create_widgets(self):
@@ -26,6 +28,8 @@ class DNESimTargetingFrame(ttk.LabelFrame):
             ('Range Rate (m/s):', self.range_rate),
             ('Fire:', self.fire),
             ('State Command:', self.state_command),
+            ('Hit Confirmation:', self.hit_confirmation),
+            ('Time (µs):', self.time_us),
         ]
         for row, (label, var) in enumerate(fields):
             ttk.Label(self, text=label).grid(row=row, column=0, padx=10, pady=4, sticky='e')
@@ -33,7 +37,8 @@ class DNESimTargetingFrame(ttk.LabelFrame):
 
     #===================================================================
 
-    def update_targeting(self, az, el, range_m, az_rate, el_rate, range_rate, fire, state_command):
+    def update_targeting(self, az, el, range_m, az_rate, el_rate, range_rate, fire, state_command,
+                         hit_confirmation=0, time_us=0):
         self.az.set(round(az, 2))
         self.el.set(round(el, 2))
         self.range_m.set(round(range_m, 2))
@@ -42,3 +47,5 @@ class DNESimTargetingFrame(ttk.LabelFrame):
         self.range_rate.set(round(range_rate, 2))
         self.fire.set(fire)
         self.state_command.set(state_command)
+        self.hit_confirmation.set(hit_confirmation)
+        self.time_us.set(time_us)

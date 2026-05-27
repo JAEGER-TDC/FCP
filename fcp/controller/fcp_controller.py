@@ -10,7 +10,7 @@ from model.fcp_model import FCPModel
 from model.rat_model import Rat
 from model.node_model import Node
 from view.fcp_view import FCPView
-from protocol.dne_target import Target, PacketReceiver, make_packet
+from protocol.dne_target import Target, DNEHealth, PacketReceiver, make_packet
 from view.frames.alert_frame import INFO, WARNING, ERROR
 from cv.cv_engine import CVEngine
 from cv.cv_engine_sim import CVEngineSimulator
@@ -125,7 +125,7 @@ class FCPController:
                             primary_rat = self.model.rats[primary_id]
                             if primary_rat.zone >= 2:
                                 fire = 1 if primary_id in self.model.engaged_rats else 0
-                                state_cmd = 2 if fire else 1
+                                state_cmd = 3 if fire else 2
                                 self._send_dne_targeting(primary_rat, fire=fire, state_command=state_cmd)
 
                     if data_dict.get('msg_type') == 'health':
@@ -174,9 +174,9 @@ class FCPController:
                                 'DNE effector offline or unresponsive', ERROR))
                         continue
                     result = receiver.process_byte(byte[0])
-                    if result is not None:
+                    if result is not None and isinstance(result, DNEHealth):
                         last_echo = time.time()
-                        laser = bool(result.fire)
+                        laser = bool(result.laser_firing)
                         was_unhealthy = not self.model.dne_healthy
                         self.model.dne_healthy = True
                         self.model.dne_laser_firing = laser
@@ -193,7 +193,8 @@ class FCPController:
 
     #===================================================================
 
-    def _send_dne_targeting(self, rat: Rat, fire: int = 0, state_command: int = 1):
+    def _send_dne_targeting(self, rat: Rat, fire: int = 0, state_command: int = 2,
+                            hit_confirmation: int = 0):
         if self._ser is None:
             return
         try:
@@ -201,6 +202,8 @@ class FCPController:
                 rat.az_value, rat.el_value, rat.range_value,
                 rat.az_rate, rat.el_rate, rat.range_rate,
                 fire, state_command,
+                hit_confirmation=hit_confirmation,
+                time=time.time_ns() // 1000,
             )
             with self._ser_lock:
                 self._ser.write(make_packet(t))
@@ -515,6 +518,9 @@ class FCPController:
             self.model.pending_engage_rat_id = None
         self._engage_dwell.pop(rat_id, None)
         self._hit_confirm = None
+        rat = self.model.rats.get(rat_id)
+        if rat:
+            self._send_dne_targeting(rat, fire=0, state_command=2, hit_confirmation=1)
         self._send_hit_confirmation(rat_id)
         self.model.analytics_db.log_rat_event(rat_id, 'neutralized')
         self.view.alert_frame.add_alert(f'RAT {rat_id} NEUTRALIZED', INFO)
@@ -644,7 +650,7 @@ class FCPController:
             self.cv_engine.set_engaged(True)
         rat = self.model.rats.get(rat_id)
         if rat:
-            self._send_dne_targeting(rat, fire=1, state_command=2)
+            self._send_dne_targeting(rat, fire=1, state_command=3)
         pid = self.model.primary_target_id
         er  = set(self.model.engaged_rats)
         self.view.after(0, lambda p=pid, e=er:
@@ -687,7 +693,7 @@ class FCPController:
         self.model.pending_engage_rat_id = None
         rat = self.model.rats.get(pid)
         if rat and rat.zone >= 2:
-            self._send_dne_targeting(rat, fire=0, state_command=1)
+            self._send_dne_targeting(rat, fire=0, state_command=2)
         if was_engaged:
             self.model.analytics_db.log_rat_event(pid, 'engage_cancelled')
             self.view.after(0, lambda i=pid: self.view.alert_frame.add_alert(
