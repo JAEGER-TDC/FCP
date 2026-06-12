@@ -1,4 +1,6 @@
 import os
+import queue
+import threading
 import cv2
 import numpy as np
 from PyQt6.QtWidgets import (
@@ -53,11 +55,19 @@ class VideoFrame(BaseFrame):
         self._tuning_panel        = None
         self._pause_overlay_shown = False
         self._scope_zoom          = 2.0   # current zoom level (cycles through _ZOOM_LEVELS)
+        self._recording           = False
+        self._video_writer        = None
+        self._rec_queue:  queue.Queue = queue.Queue(maxsize=30)
+        self._rec_thread: threading.Thread | None = None
 
         super().__init__(parent)
 
         self._frame_timer = QTimer(self)
         self._frame_timer.timeout.connect(self._grab_frame)
+
+        self._scope_timer = QTimer(self)
+        self._scope_timer.timeout.connect(self._update_scope_from_engine)
+        self._scope_timer.start(100)   # 10fps scope refresh — decoupled from video
 
         self._set_placeholder()
 
@@ -110,6 +120,16 @@ class VideoFrame(BaseFrame):
         _bl.addWidget(self._load_btn, stretch=1)
         _bl.addWidget(self._gear_btn)
         right_vbox.addWidget(btn_row)
+
+        # Record button — only shown in live camera mode
+        self._record_btn = QPushButton('⏺  Record')
+        self._record_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._record_btn.setStyleSheet(
+            'background:#FFFFFF; color:#C62828; border:1px solid #CCCCCC;'
+            ' padding:3px 4px; font:bold 8pt Helvetica;')
+        self._record_btn.clicked.connect(self._toggle_recording)
+        self._record_btn.setVisible(False)   # hidden until camera mode selected
+        right_vbox.addWidget(self._record_btn)
 
         # ── HUD table ──────────────────────────────────────────────────
         self._hud_widget = QWidget()
@@ -234,6 +254,70 @@ class VideoFrame(BaseFrame):
     # Scope rendering
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Recording (raw camera feed, no overlays)
+    # ------------------------------------------------------------------
+
+    def _toggle_recording(self) -> None:
+        if self._recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self) -> None:
+        if self._cv_engine is None:
+            return
+        meta = self._cv_engine.get_metadata()
+        w, h = meta.get('frame_w', 640), meta.get('frame_h', 480)
+        if w == 0 or h == 0:
+            return
+        import datetime as _dt
+        rec_dir = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'data', 'recordings')
+        os.makedirs(rec_dir, exist_ok=True)
+        ts   = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = os.path.abspath(os.path.join(rec_dir, f'raw_{ts}.mp4'))
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self._video_writer = cv2.VideoWriter(path, fourcc, 15.0, (w, h))
+        if not self._video_writer.isOpened():
+            self._video_writer = None
+            return
+        # Background thread drains the write queue so disk I/O never blocks Qt
+        self._rec_thread = threading.Thread(target=self._rec_writer_loop,
+                                            daemon=True, name='Recorder')
+        self._rec_thread.start()
+        self._recording = True
+        self._record_btn.setText('⏹  Stop')
+        self._record_btn.setStyleSheet(
+            'background:#C62828; color:white; border:1px solid #8B0000;'
+            ' padding:3px 4px; font:bold 8pt Helvetica;')
+        print(f'[Record] started → {path}  ({w}x{h} @15fps, no overlays)')
+
+    def _stop_recording(self) -> None:
+        if not self._recording:
+            return
+        self._recording = False
+        self._rec_queue.put(None)        # sentinel — tells writer thread to stop
+        if self._rec_thread is not None:
+            self._rec_thread.join(timeout=3.0)
+            self._rec_thread = None
+        if self._video_writer is not None:
+            self._video_writer.release()
+            self._video_writer = None
+        self._record_btn.setText('⏺  Record')
+        self._record_btn.setStyleSheet(
+            'background:#FFFFFF; color:#C62828; border:1px solid #CCCCCC;'
+            ' padding:3px 4px; font:bold 8pt Helvetica;')
+        print('[Record] stopped')
+
+    def _rec_writer_loop(self) -> None:
+        """Background thread: drains _rec_queue and writes frames to disk."""
+        while True:
+            frame = self._rec_queue.get()
+            if frame is None:            # sentinel
+                break
+            if self._video_writer is not None:
+                self._video_writer.write(frame)
+
     def _cycle_zoom(self) -> None:
         idx = _ZOOM_LEVELS.index(self._scope_zoom) if self._scope_zoom in _ZOOM_LEVELS else 0
         self._scope_zoom = _ZOOM_LEVELS[(idx + 1) % len(_ZOOM_LEVELS)]
@@ -356,13 +440,13 @@ class VideoFrame(BaseFrame):
         self._cv_engine = engine
         engine.start()
         self._running  = True
+        is_camera = getattr(getattr(engine, '_cfg', None), 'USE_LIVE_CAMERA', False)
         self._delay_ms = 33
         self._frame_timer.start(self._delay_ms)
         if self._tuning_panel is not None and not self._tuning_panel.isHidden():
             self._tuning_panel.set_engine(engine)
-        # Hide Load Video when using a live camera feed
-        is_camera = getattr(getattr(engine, '_cfg', None), 'USE_LIVE_CAMERA', False)
         self._load_btn.setVisible(not is_camera)
+        self._record_btn.setVisible(is_camera)
 
     # ------------------------------------------------------------------
     # Timer slot
@@ -401,16 +485,23 @@ class VideoFrame(BaseFrame):
         img = QImage(frame_rgb.data, w, h, w * ch, QImage.Format.Format_RGB888)
         self._display_pixmap(QPixmap.fromImage(img))
 
-        # Update scope from raw frame every display tick
-        if self._cv_engine is not None:
-            self._update_scope_from_engine()
+        # Enqueue raw frame for background recording (non-blocking)
+        if self._recording and self._cv_engine is not None:
+            raw = self._cv_engine.get_raw_frame()
+            if raw is not None:
+                try:
+                    self._rec_queue.put_nowait(raw.copy())
+                except queue.Full:
+                    pass   # drop frame rather than block Qt
 
     # ------------------------------------------------------------------
     # Stop / clear
     # ------------------------------------------------------------------
 
     def stop_video(self) -> None:
+        self._stop_recording()
         self._load_btn.setVisible(True)
+        self._record_btn.setVisible(False)
         self._pause_overlay.hide()
         self._pause_overlay_shown = False
         self._running = False

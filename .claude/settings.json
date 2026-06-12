@@ -36,7 +36,8 @@
       "Bash(git -C /home/lockheed/FCP checkout -b DustinEdits)",
       "Bash(xargs cat)",
       "Bash(python -c \"import sys; sys.path.insert\\(0,'fcp'\\); from cv.hit_confirm import HitConfirmEngine, HitConfirmConfig; print\\('hit_confirm OK'\\)\")",
-      "Bash(python3 -c \"import tensorrt\")"
+      "Bash(python3 -c \"import tensorrt\")",
+      "Bash(git -C /home/lockheed/FCP diff fcp/view/frames/video_frame.py fcp/cv/cv_engine.py)"
     ],
     "additionalDirectories": [
       "/home/lockheed/.claude/plans"

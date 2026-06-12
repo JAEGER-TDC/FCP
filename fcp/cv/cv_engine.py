@@ -201,16 +201,18 @@ class CVEngine:
                     f"Run in PowerShell (Admin):  usbipd attach --wsl --busid <ID>")
                 return
             # Try formats in order until frames actually arrive.
-            # Logitech BRIO and most modern USB cameras are MJPEG-primary;
-            # YUYV is added as fallback only.
+            # Prefer high-res/high-fps MJPG first; fall back to more
+            # conservative formats only if negotiation/streaming fails
+            # (e.g. on flaky WSL2 USB passthrough).
             _candidates = [
-                ('MJPG', 1280,  720, 30),
-                ('MJPG',  640,  480, 30),
-                ('MJPG',  640,  480, 60),
-                ('MJPG',  320,  240, 30),
-                ('YUYV',  640,  480, 15),
-                ('YUYV',  320,  240, 15),
-                (None,    640,  480, 30),   # let driver pick
+                ('MJPG', 1280, 720, 30),
+                ('MJPG',  640, 480, 60),
+                ('MJPG',  640, 480, 30),
+                ('MJPG',  320, 240, 30),
+                ('YUYV',  640, 480, 15),
+                ('MJPG',  640, 480, 15),
+                ('YUYV',  320, 240, 10),
+                (None,    640, 480, 15),   # let driver pick
             ]
             cap      = None
             live_cap = None

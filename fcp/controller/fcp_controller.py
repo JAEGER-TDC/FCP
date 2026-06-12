@@ -1,5 +1,4 @@
 import os
-import socket
 import threading
 import json
 import time
@@ -24,11 +23,8 @@ class FCPController:
 
         self.config = self.read_config(os.path.join(os.path.dirname(__file__), '..', 'cfg', 'config.ini'))
 
-        self.dnn_recv_ip = self.config['DNN.recv.connection']['ip']
-        self.dnn_recv_port = self.config['DNN.recv.connection'].getint('port')
-
-        self.dnn_send_ip = self.config['DNN.send.connection']['ip']
-        self.dnn_send_port = self.config['DNN.send.connection'].getint('port')
+        self.dnn_serial_port = self.config['DNN.serial']['port']
+        self.dnn_serial_baud = self.config['DNN.serial'].getint('baudrate')
 
         self.dne_port = self.config['DNE.serial']['port']
         self.dne_baud = self.config['DNE.serial'].getint('baudrate')
@@ -39,6 +35,9 @@ class FCPController:
         self._known_rats: set[str] = set()
         self._rat_zones: dict[str, int] = {}
         self._rat_last_seen: dict[str, float] = {}
+
+        self._dnn_ser: serial.SerialBase | None = None
+        self._dnn_ser_lock = threading.Lock()
 
         self._ser: serial.SerialBase | None = None
         self._ser_lock = threading.Lock()
@@ -53,7 +52,11 @@ class FCPController:
         # Per-RAT accumulated on-target dwell seconds; reset when off-target or lock lost
         self._engage_dwell: dict[str, float] = {}
 
-        self._start_udp_listener()
+        # Sim-only: auto-inject a synthetic RAT and engage it when CV locks,
+        # so the dwell→neutralize path can be tested without a live DNN.
+        self._sim_auto_engage: bool = False
+
+        self._start_dnn_serial()
         self._start_dne_serial()
         self.view.after(5000, self._check_staleness)
         self.view.after(500, self._poll_cv_state)
@@ -77,22 +80,30 @@ class FCPController:
 
     #===================================================================
 
-    def _start_udp_listener(self):
-        print(f"Trying to bind UDP listener on {self.dnn_recv_ip}:{self.dnn_recv_port}")
-
+    def _start_dnn_serial(self):
+        print(f"Connecting to DNN on {self.dnn_serial_port} @ {self.dnn_serial_baud}")
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.bind((self.dnn_recv_ip, self.dnn_recv_port))
-            print("UDP listener successfully bound")
+            self._dnn_ser = serial.Serial(self.dnn_serial_port, baudrate=self.dnn_serial_baud, timeout=1.0)
+            print("DNN serial connection established")
         except Exception as e:
-            print(f"Failed to bind UDP listener on {self.dnn_recv_ip}:{self.dnn_recv_port}: {e}")
+            print(f"Failed to connect to DNN on {self.dnn_serial_port}: {e}")
+            self._dnn_ser = None
             return
 
-        def _listen_loop(s):
+        def _listen_loop(ser):
             while True:
                 try:
-                    data, addr = s.recvfrom(65535)
-                    data_dict = json.loads(data.decode('utf-8'))
+                    line = ser.readline()
+                    if not line:
+                        continue
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data_dict = json.loads(line.decode('utf-8'))
+                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                        print(f"DNN serial: bad message {line!r}: {e}")
+                        continue
 
                     if data_dict.get('msg_type') == 'positional':
                         rat = Rat(data_dict)
@@ -128,7 +139,7 @@ class FCPController:
                                 state_cmd = 2 if fire else 1
                                 self._send_dne_targeting(primary_rat, fire=fire, state_command=state_cmd)
 
-                    if data_dict.get('msg_type') == 'health':
+                    elif data_dict.get('msg_type') == 'health':
                         node = Node(data_dict)
                         self._dnn_last_health_time = time.time()
                         self._dnn_offline_alerted = False
@@ -137,11 +148,11 @@ class FCPController:
 
                 except Exception as e:
                     import traceback
-                    print(f"UDP listener error: {e}")
+                    print(f"DNN serial listener error: {e}")
                     traceback.print_exc()
                     continue
 
-        t = threading.Thread(target=_listen_loop, args=(sock,), daemon=True)
+        t = threading.Thread(target=_listen_loop, args=(self._dnn_ser,), daemon=True)
         t.start()
 
     #===================================================================
@@ -383,6 +394,8 @@ class FCPController:
         if new_state == 'LOCKED' and prev_state != 'LOCKED':
             self.model.analytics_db.log_rat_event(
                 'CV_SYSTEM', 'cv_lock', confidence=meta['confidence'])
+            if self._sim_auto_engage and not self.model.engaged_rats:
+                self._inject_sim_rat()
 
         # Dwell-based kill confirmation: accumulate on-target time per engaged RAT
         on_target = meta.get('on_target', False)
@@ -450,6 +463,7 @@ class FCPController:
         cfg = DrawConfig()
         self._load_cv_tuning(cfg)
         self.cv_engine = CVEngineSimulator(video_path=_video, cfg=cfg)
+        self._sim_auto_engage = True
         self.view.video_frame.play_cv_engine(self.cv_engine)
 
     def start_mode_video(self, path: str) -> None:
@@ -460,6 +474,7 @@ class FCPController:
         cfg = DrawConfig()
         self._load_cv_tuning(cfg)
         self.cv_engine = CVEngine(video_path=path, cfg=cfg)
+        self._sim_auto_engage = True
         self.view.video_frame.play_cv_engine(self.cv_engine)
 
     def start_mode_camera(self, camera_index: int = 0) -> None:
@@ -470,6 +485,7 @@ class FCPController:
         if self.cv_engine is not None:
             self.cv_engine.stop()
         self.cv_engine = CVEngine(video_path=None, cfg=cfg)
+        self._sim_auto_engage = False
         self.view.video_frame.play_cv_engine(self.cv_engine)
 
     def load_video(self, path: str) -> None:
@@ -560,30 +576,32 @@ class FCPController:
             "rat_id": rat_id,
             "current_time": time.strftime('%Y-%m-%dT%H:%M:%S'),
         }
+        self._dnn_serial_send(msg)
+
+    #===================================================================
+
+    def _dnn_serial_send(self, msg: dict) -> None:
+        """Write a JSON message to the DNN over serial (newline-terminated)."""
+        if self._dnn_ser is None:
+            return
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.sendto(json.dumps(msg).encode('utf-8'), (self.dnn_send_ip, self.dnn_send_port))
-            sock.close()
+            payload = (json.dumps(msg) + '\n').encode('utf-8')
+            with self._dnn_ser_lock:
+                self._dnn_ser.write(payload)
         except Exception as e:
-            print(f"Failed to send hit confirmation for {rat_id}: {e}")
+            print(f"Failed to send to DNN over serial: {e}")
 
     #===================================================================
 
     def _send_detection_command(self, mode: str, enabled: bool):
-        """Send a UDP JSON command to the DNN indicating a detection-mode change."""
+        """Send a JSON command to the DNN over serial indicating a detection-mode change."""
         msg = {
             "msg_type": "command",
             "command": "set_detection_mode",
             "mode": mode,
-            "enabled": enabled
+            "enabled": enabled,
         }
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            payload = json.dumps(msg).encode('utf-8')
-            sock.sendto(payload, (self.dnn_send_ip, self.dnn_send_port))
-            sock.close()
-        except Exception as e:
-            print(f"Failed to send detection command for {mode}: {e}")
+        self._dnn_serial_send(msg)
 
     #===================================================================
 
@@ -631,6 +649,22 @@ class FCPController:
         self.view.after(0, lambda: self.view.control_frame.update_engagement_active(
             bool(self.model.engaged_rats)))
         self.view.after(5000, self._check_staleness)
+
+    #===================================================================
+
+    def _inject_sim_rat(self) -> None:
+        """Inject a synthetic zone-3 RAT and engage it for dwell testing."""
+        sim_id = 'SIM-1'
+        self.model.neutralized_rats.discard(sim_id)
+        rat = Rat({
+            'rat_id': sim_id, 'zone': 3,
+            'values': {'az_value': 0.0, 'el_value': 0.0, 'range_value': 25.0},
+            'rates':  {'az_rate':  0.0, 'el_rate':  0.0, 'range_rate':  0.0},
+        })
+        self.model.update_rat(rat)
+        self.model.primary_target_id = sim_id
+        self.view.alert_frame.add_alert('[SIM] Auto-engaged SIM-1 for dwell test', INFO)
+        self.engage_rat(sim_id)
 
     #===================================================================
 

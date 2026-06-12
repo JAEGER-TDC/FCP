@@ -1,0 +1,21 @@
+Section A — Sensor Mode Usage
+Sensor,Times Enabled,Total Duration (s),% Mission Time
+LiDAR,1,11.7,99.9
+RF,1,11.7,99.9
+Acoustic,1,11.6,99.8
+
+Section B — Time to Detect / Engage
+Target,First Detected,Reached Zone 3,Engage Cmd,Neutralized,Detect→Z3 (s),Detect→Engage (s),Engage→Neut (s)
+
+Section C — F2T2EA Event Rates & Durations
+Target,Detect→Z3 (s),Z3→Engage (s),Engage→Neut (s),Total F2T2EA (s)
+
+Section D — Identification Accuracy
+Avg CV Confidence (LOCKED),0.921
+Lock samples this mission,1
+
+Section E — Engagement Success Rate
+Target,Engagements,Hits,Success Rate (%)
+
+Section F — Losses per Target
+Target,Track Losses
