@@ -46,6 +46,10 @@ class MapFrame(BaseFrame):
         self._engaged_rats: set = set()
         self._neutralized_rats: set[str] = set()
 
+        # DNE aimed position — updated by update_dne_aim(); None = not tracking
+        self._dne_aim: tuple[float, float, float] | None = None  # (az_deg, el_deg, range_m)
+        self._dne_aim_visible: bool = False  # toggled by "Show DNE Aim" checkbox
+
         # Fonts — created after QApplication exists (i.e., here in create_widgets)
         self._font_bold   = QFont(theme.FONT_FAMILY, theme.FONT_SIZE)
         self._font_bold.setBold(True)
@@ -106,6 +110,15 @@ class MapFrame(BaseFrame):
 
     def update_neutralized_rats(self, neutralized: set[str]):
         self._neutralized_rats = neutralized
+        self.update()
+
+    def update_dne_aim(self, az: float, el: float, range_m: float):
+        self._dne_aim = (az, el, range_m)
+        if self._dne_aim_visible:
+            self.update()
+
+    def set_dne_aim_visible(self, visible: bool):
+        self._dne_aim_visible = visible
         self.update()
 
     # ------------------------------------------------------------------
@@ -211,6 +224,36 @@ class MapFrame(BaseFrame):
                 painter.setBrush(QBrush(QColor(theme.RAT_DETECTED)))
                 painter.setPen(QPen(QColor(theme.MAP_TEXT), 1))
                 painter.drawEllipse(QPointF(rx, ry), _RAT_DOT_R, _RAT_DOT_R)
+
+        # DNE aim reticle — where the effector is currently commanded to point
+        if self._dne_aim_visible and self._dne_aim is not None:
+            dne_az, _dne_el, dne_range = self._dne_aim
+            if 0 < dne_range <= 85:
+                angle_rad = math.radians(dne_az)
+                r_px  = dne_range / 85.0 * max_r
+                rx    = cx + r_px * math.cos(angle_rad)
+                ry    = cy - r_px * math.sin(angle_rad)
+                # Outer ring + crosshairs
+                firing = dne_az is not None and self._dne_laser_firing
+                rim_color = '#ff4444' if firing else '#00e5ff'
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(rim_color), 2))
+                painter.drawEllipse(QPointF(rx, ry), 14, 14)
+                cl = 18
+                painter.drawLine(QPointF(rx - cl, ry), QPointF(rx - 15, ry))
+                painter.drawLine(QPointF(rx + 15, ry), QPointF(rx + cl, ry))
+                painter.drawLine(QPointF(rx, ry - cl), QPointF(rx, ry - 15))
+                painter.drawLine(QPointF(rx, ry + 15), QPointF(rx, ry + cl))
+                # Centre dot
+                painter.setBrush(QBrush(QColor(rim_color)))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QPointF(rx, ry), 3, 3)
+                # "DNE" label just above the reticle
+                painter.setPen(QPen(QColor(rim_color)))
+                painter.setFont(self._font_small)
+                fm = painter.fontMetrics()
+                lbl = 'DNE'
+                painter.drawText(QPointF(rx - fm.horizontalAdvance(lbl) / 2, ry - 20), lbl)
 
         # Legend — top-left corner of fan area
         legend_x, legend_y = _HPAD + 6, 10

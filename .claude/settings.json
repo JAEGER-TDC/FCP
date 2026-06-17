@@ -37,10 +37,16 @@
       "Bash(xargs cat)",
       "Bash(python -c \"import sys; sys.path.insert\\(0,'fcp'\\); from cv.hit_confirm import HitConfirmEngine, HitConfirmConfig; print\\('hit_confirm OK'\\)\")",
       "Bash(python3 -c \"import tensorrt\")",
-      "Bash(git -C /home/lockheed/FCP diff fcp/view/frames/video_frame.py fcp/cv/cv_engine.py)"
+      "Bash(git -C /home/lockheed/FCP diff fcp/view/frames/video_frame.py fcp/cv/cv_engine.py)",
+      "Bash(git -C /home/lockheed/FCP branch)",
+      "Bash(git -C /home/lockheed/FCP checkout DustinEdits)",
+      "Bash(python3 -c \"import struct; print\\(struct.calcsize\\('<6f3BQ'\\)\\)\")",
+      "Bash(mkdir /home/lockheed/FCP/fcp/protocol)",
+      "Bash(python3 -c \"import serial.tools.list_ports; print\\('ok'\\)\")"
     ],
     "additionalDirectories": [
-      "/home/lockheed/.claude/plans"
+      "/home/lockheed/.claude/plans",
+      "/home/lockheed/FCP/fcp"
     ]
   }
 }

@@ -16,59 +16,146 @@ import os
 import time
 import queue
 import threading
+import ctypes as _ct
+import multiprocessing as _mp
 from collections import deque
 
 import cv2
 import numpy as np
 
 
+# ---------------------------------------------------------------------------
+# Camera capture subprocess
+# ---------------------------------------------------------------------------
+# Top-level function so multiprocessing can pickle it for 'spawn'.
+
+def _camera_worker_proc(cam_idx, fourcc_str, req_w, req_h, fps,
+                        shared_arr, arr_shape, frame_count,
+                        cap_props, stop_flag):
+    """
+    Isolated subprocess: opens the camera and writes frames into shared memory.
+    libjpeg SIGSEGV / SIGABRT from corrupted MJPG data crash only this child;
+    the parent FCP process is completely unaffected.
+    """
+    import cv2
+    import numpy as np
+
+    buf = np.frombuffer(shared_arr.get_obj(), dtype=np.uint8).reshape(arr_shape)
+
+    cap = cv2.VideoCapture(cam_idx, cv2.CAP_V4L2)
+    if fourcc_str:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc_str))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,      req_w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,     req_h)
+    cap.set(cv2.CAP_PROP_FPS,              fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,       4)
+    cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
+
+    # Report actual negotiated properties back to parent via shared array.
+    cap_props[0] = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    cap_props[1] = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    cap_props[2] = cap.get(cv2.CAP_PROP_FPS) or fps
+    cap_props[3] = cap.get(cv2.CAP_PROP_SAR_NUM)
+    cap_props[4] = cap.get(cv2.CAP_PROP_SAR_DEN)
+
+    while not stop_flag.value:
+        try:
+            ret, frame = cap.read()
+        except Exception:
+            continue
+        if not ret or frame is None or frame.size == 0:
+            continue
+        if frame.shape == arr_shape:
+            np.copyto(buf, frame)
+            with frame_count.get_lock():
+                frame_count.value += 1
+
+    cap.release()
+
+
 class _LiveCapture:
     """
-    Dedicated capture thread for live cameras.
+    Camera capture using an isolated subprocess for crash safety.
 
-    Reads frames as fast as the camera delivers them and always keeps only
-    the most recent one.  The TRT loop calls read() to get the freshest
-    frame instantly — no stale buffering, no lag accumulation.
+    libjpeg aborts (SIGSEGV / SIGABRT) from corrupted MJPG data kill only the
+    worker subprocess; the parent FCP process survives and the worker restarts
+    automatically on the next frame cycle.
     """
 
-    def __init__(self, cap: cv2.VideoCapture):
-        self._cap   = cap
+    _CTX = _mp.get_context('spawn')  # safe with Qt's multi-threaded parent
+
+    def __init__(self, cam_idx: int, fourcc_str: str | None,
+                 w: int, h: int, fps: int):
+        self._cam_idx    = cam_idx
+        self._fourcc_str = fourcc_str
+        self._req_w      = w
+        self._req_h      = h
+        self._req_fps    = fps
+        self._shape      = (h, w, 3)
+
         self._frame: np.ndarray | None = None
-        self._lock  = threading.Lock()
-        self._stop  = threading.Event()
-        self._ready = threading.Event()
-        self._t     = threading.Thread(target=self._run, daemon=True,
-                                       name='LiveCapture')
-        self._t.start()
+        self._lock   = threading.Lock()
+        self._ready  = threading.Event()
+        self._stopped = False
+
+        n = h * w * 3
+        self._shared_arr  = self._CTX.Array(_ct.c_uint8,  n)
+        self._frame_count = self._CTX.Value(_ct.c_uint64, 0)
+        self._stop_flag   = self._CTX.Value(_ct.c_bool,   False)
+        self._cap_props   = self._CTX.Array(_ct.c_double, 5)  # w,h,fps,sar_n,sar_d
+
+        self._start_worker()
+        self._mon = threading.Thread(target=self._monitor, daemon=True,
+                                     name='LiveCapMon')
+        self._mon.start()
+
+    def _start_worker(self):
+        self._proc = self._CTX.Process(
+            target=_camera_worker_proc,
+            args=(self._cam_idx, self._fourcc_str,
+                  self._req_w, self._req_h, self._req_fps,
+                  self._shared_arr, self._shape,
+                  self._frame_count, self._cap_props, self._stop_flag),
+            daemon=True,
+        )
+        self._proc.start()
+
+    def _monitor(self):
+        buf  = np.frombuffer(self._shared_arr.get_obj(),
+                             dtype=np.uint8).reshape(self._shape)
+        last = 0
+        while not self._stopped:
+            if not self._proc.is_alive() and not self._stop_flag.value:
+                print(f'[Camera] worker crashed (exit {self._proc.exitcode}), restarting...')
+                self._start_worker()
+            with self._frame_count.get_lock():
+                cnt = self._frame_count.value
+            if cnt != last:
+                last  = cnt
+                frame = buf.copy()
+                with self._lock:
+                    self._frame = frame
+                self._ready.set()
+            else:
+                time.sleep(0.005)
 
     def read(self) -> np.ndarray | None:
         with self._lock:
             return None if self._frame is None else self._frame.copy()
 
     def wait_first(self, timeout: float = 5.0) -> bool:
-        """Block until the first frame arrives or timeout. Returns True on success."""
         return self._ready.wait(timeout)
 
-    def stop(self):
-        self._stop.set()
-        self._t.join(timeout=2.0)
+    def get_props(self) -> tuple:
+        """(act_w, act_h, fps, sar_num, sar_den) as reported by the subprocess."""
+        return tuple(self._cap_props)
 
-    def _run(self):
-        while not self._stop.is_set():
-            try:
-                ret, frame = self._cap.read()
-            except Exception:
-                # libjpeg can throw C++ exceptions through cap.read() on
-                # corrupt MJPG frames — catch everything to prevent abort
-                time.sleep(0.01)
-                continue
-            # Discard corrupt / zero-size frames
-            if not ret or frame is None or frame.size == 0:
-                time.sleep(0.005)
-                continue
-            with self._lock:
-                self._frame = frame
-            self._ready.set()
+    def stop(self):
+        self._stopped = True
+        self._stop_flag.value = True
+        if self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=2.0)
 
 
 class CVEngine:
@@ -98,6 +185,7 @@ class CVEngine:
         self._raw_frame:  np.ndarray | None = None   # pre-annotation frame for hit confirm
         self._thread: threading.Thread | None = None
         self._error: str | None = None
+        self._dwell_progress: float = 0.0  # 0.0–1.0; drawn as arc on the lock ring
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -127,6 +215,11 @@ class CVEngine:
     def get_raw_frame(self) -> np.ndarray | None:
         """Return the most recent raw (pre-annotation) frame, or None."""
         return self._raw_frame
+
+    def set_dwell_progress(self, frac: float) -> None:
+        """Set the dwell kill-confirm progress (0.0 = none, 1.0 = confirmed).
+        Drawn as a green arc filling clockwise around the lock ring."""
+        self._dwell_progress = max(0.0, min(1.0, frac))
 
     def update_config(self, attr: str, value) -> None:
         """Mutate a Config field live — the tracking loop picks it up next frame.
@@ -201,48 +294,35 @@ class CVEngine:
                     f"Run in PowerShell (Admin):  usbipd attach --wsl --busid <ID>")
                 return
             # Try formats in order until frames actually arrive.
-            # Prefer high-res/high-fps MJPG first; fall back to more
-            # conservative formats only if negotiation/streaming fails
-            # (e.g. on flaky WSL2 USB passthrough).
+            # YUYV (uncompressed) is listed first: no JPEG decoding means no
+            # libjpeg crashes from truncated frames over WSL2 USB passthrough.
+            # MJPG is tried last as a fallback for cameras that don't do YUYV.
             _candidates = [
-                ('MJPG', 1280, 720, 30),
-                ('MJPG',  640, 480, 60),
-                ('MJPG',  640, 480, 30),
-                ('MJPG',  320, 240, 30),
+                ('YUYV',  640, 480, 30),
                 ('YUYV',  640, 480, 15),
+                ('YUYV',  320, 240, 30),
+                ('MJPG',  640, 480, 30),
                 ('MJPG',  640, 480, 15),
-                ('YUYV',  320, 240, 10),
+                ('MJPG',  320, 240, 30),
                 (None,    640, 480, 15),   # let driver pick
             ]
-            cap      = None
-            live_cap = None
+            live_cap      = None
+            neg_fourcc    = None
+            neg_w = neg_h = neg_fps = 0
             for fourcc_str, w, h, fps in _candidates:
-                if cap is not None:
-                    cap.release()
-                cap = cv2.VideoCapture(cam_idx, cv2.CAP_V4L2)
-                if not cap.isOpened():
-                    self._error = f"Cannot open camera index {cam_idx}"
-                    return
-                if fourcc_str:
-                    cap.set(cv2.CAP_PROP_FOURCC,
-                            cv2.VideoWriter_fourcc(*fourcc_str))
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-                cap.set(cv2.CAP_PROP_FPS,          fps)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE,   4)
                 print(f'[CVEngine] trying {fourcc_str or "auto"} {w}x{h}@{fps}fps ...')
-                live_cap = _LiveCapture(cap)
-                if live_cap.wait_first(timeout=3.0):
-                    act_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    act_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                live_cap = _LiveCapture(cam_idx, fourcc_str, w, h, fps)
+                if live_cap.wait_first(timeout=5.0):
+                    act_w, act_h, act_fps, _, _ = live_cap.get_props()
+                    act_w, act_h = int(act_w) or w, int(act_h) or h
                     print(f'[CVEngine] camera OK: {fourcc_str or "auto"} '
-                          f'{act_w}x{act_h} @{fps}fps')
+                          f'{act_w}x{act_h} @{act_fps:.0f}fps')
+                    neg_fourcc, neg_w, neg_h, neg_fps = fourcc_str, act_w, act_h, act_fps
                     break
                 print(f'[CVEngine] no frames — skipping')
                 live_cap.stop()
                 live_cap = None
             else:
-                cap.release()
                 self._error = ("Camera opened but no frames received — "
                                "check usbipd attach and /dev/video permissions")
                 return
@@ -252,14 +332,19 @@ class CVEngine:
                 self._error = f"Cannot open video: {self._video_path}"
                 return
 
-        cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
-        fps_src   = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        frame_dt  = 1.0 / fps_src
-        w_cap     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h_cap     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if is_live:
+            _, _, fps_src, sar_num, sar_den = live_cap.get_props()
+            fps_src = fps_src or neg_fps or 30.0
+            w_cap, h_cap = neg_w, neg_h
+        else:
+            cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
+            fps_src = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            w_cap   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h_cap   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            sar_num = cap.get(cv2.CAP_PROP_SAR_NUM)
+            sar_den = cap.get(cv2.CAP_PROP_SAR_DEN)
 
-        sar_num = cap.get(cv2.CAP_PROP_SAR_NUM)
-        sar_den = cap.get(cv2.CAP_PROP_SAR_DEN)
+        frame_dt = 1.0 / fps_src
         if sar_num > 0 and sar_den > 0 and abs(sar_num / sar_den - 1.0) > 0.02:
             display_w = max(1, int(w_cap * sar_num / sar_den))
             display_h = h_cap
@@ -267,7 +352,7 @@ class CVEngine:
             display_w, display_h = w_cap, h_cap
         needs_resize = (display_w != w_cap or display_h != h_cap)
 
-        reader   = FrameReader(cap)
+        reader   = None if is_live else FrameReader(cap)
         filter_x = OneEuroFilter(cfg.oef_min_cutoff, cfg.oef_beta)
         filter_y = OneEuroFilter(cfg.oef_min_cutoff, cfg.oef_beta)
         kalman   = KalmanTracker()
@@ -448,7 +533,7 @@ class CVEngine:
             _draw_hud(show, scx, scy, laser_x, laser_y,
                       status, color, avg_fps, peak_ms, last_conf,
                       lost_frames, frame_num, vx, vy, blobs_show, sky_ref,
-                      False, cfg)
+                      False, cfg, self._dwell_progress)
 
             if cfg.SHOW_ZOOM_INSET and status in ("LOCKED", "DARK LOCK"):
                 _draw_zoom_inset(show, frame, cx, cy, cfg, color)

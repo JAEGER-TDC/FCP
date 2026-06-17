@@ -166,7 +166,7 @@ def _draw_hud(show, cx, cy, laser_x, laser_y,
               status, color, fps, peak_ms, conf,
               lost_frames, frame_num,
               vx, vy, dark_blobs, sky_ref,
-              arduino_ok, cfg: Config):
+              arduino_ok, cfg: Config, dwell_progress: float = 0.0):
     S, F, lw, tw = _scale_fns(show)
 
     # Dark blob candidates
@@ -200,6 +200,32 @@ def _draw_hud(show, cx, cy, laser_x, laser_y,
     # Lock ring
     if cfg.SHOW_LOCK_RING and status == "LOCKED":
         cv2.circle(show, (cx, cy), S(18), color, lw, cv2.LINE_AA)
+
+    # Dwell kill-confirm arc — fills clockwise from 12 o'clock as on-target time accumulates.
+    # Green → yellow → red as it approaches full.  Only visible while actively engaged.
+    if dwell_progress > 0.0 and status == "LOCKED":
+        r = S(28)   # slightly outside the lock ring
+        end_angle = -90 + 360 * dwell_progress
+        # Colour: interpolate green→yellow→red  (0% green, 50% yellow, 100% red)
+        if dwell_progress < 0.5:
+            t = dwell_progress * 2          # 0→1 over first half
+            arc_color = (0, int(255 * (1 - t)), int(255 * t))   # green → yellow (BGR)
+        else:
+            t = (dwell_progress - 0.5) * 2  # 0→1 over second half
+            arc_color = (0, 0, int(255 * (1 - t)) + int(128 * t))   # yellow → red
+            arc_color = (int(255 * t), int(255 * (1 - t)), 0)        # yellow → red (BGR)
+        cv2.ellipse(show, (cx, cy), (r, r), 0, -90, end_angle,
+                    arc_color, max(lw + 1, 3), cv2.LINE_AA)
+        # Countdown text just below the arc
+        secs_left = max(0.0, (1.0 - dwell_progress) * 3.0)
+        h_show, w_show = show.shape[:2]
+        font_scale = F(0.55)
+        txt = f'{secs_left:.1f}s'
+        tw_ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0]
+        tx = max(0, min(cx - tw_ // 2, w_show - tw_ - 2))
+        ty = min(cy + r + S(16), h_show - 4)
+        cv2.putText(show, txt, (tx, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, arc_color, tw, cv2.LINE_AA)
 
     # Velocity arrow
     if cfg.SHOW_VELOCITY_ARROW and status in ("LOCKED", "DARK LOCK", "PREDICTING"):

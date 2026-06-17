@@ -39,6 +39,12 @@ class DNESimController:
             with self._conn_lock:
                 self._active_conn = conn
             self.view.after(0, lambda: self.view.recv_data_frame.add_alert('FCP connected'))
+            # Send an immediate zero-state heartbeat so FCP shows Connected right away
+            try:
+                heartbeat = Target(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0)
+                conn.sendall(make_packet(heartbeat))
+            except Exception:
+                pass
             receiver = PacketReceiver()
             try:
                 while True:

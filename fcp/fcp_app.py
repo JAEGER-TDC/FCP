@@ -41,6 +41,7 @@ class FCPApp(QMainWindow):
 
         self._view.video_frame.set_load_callback(self._controller.load_video)
         self._view.video_frame.set_alert_callback(self._view.alert_frame.add_alert)
+        self._controller.start_connections()
         QTimer.singleShot(100, self._show_cv_dialog)
 
         # Do an initial analytics refresh so tables populate immediately

@@ -23,6 +23,9 @@ class CVEngineBase:
     def get_metadata(self) -> dict:
         raise NotImplementedError
 
+    def set_dwell_progress(self, frac: float) -> None:
+        """Update the on-target dwell progress (0.0–1.0) for the kill-confirm arc."""
+
     def set_engaged(self, engaged: bool) -> None:
         """Signal that a RAT is actively being engaged.
 

@@ -1,4 +1,7 @@
-from PyQt6.QtWidgets import QVBoxLayout, QHBoxLayout, QGroupBox, QPushButton
+from PyQt6.QtWidgets import (
+    QVBoxLayout, QHBoxLayout, QGroupBox, QPushButton,
+    QLabel, QCheckBox, QGridLayout, QProgressBar,
+)
 from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QFont
 from view.frames.base_frame import BaseFrame
@@ -12,22 +15,28 @@ class ControlFrame(BaseFrame):
         self.acoustic_enabled = True
         self._any_in_zone3    = False
         self._engagement_active = False
-        # Set before super().__init__() so create_widgets() can reference it.
         self.controller = controller
         super().__init__(parent)
 
-        # QTimer requires a valid QObject parent, so created after super().__init__().
         self._grace_timer = QTimer(self)
         self._grace_timer.setSingleShot(True)
         self._grace_timer.timeout.connect(self._grace_period_expired)
+
+        # Tick the "last packet age" display every 500ms
+        self._age_timer = QTimer(self)
+        self._age_timer.setInterval(500)
+        self._age_timer.timeout.connect(self._refresh_packet_age)
+        self._age_timer.start()
+        self._last_packet_time: float | None = None
 
     #===================================================================
 
     def create_widgets(self):
         vbox = QVBoxLayout(self)
         vbox.setContentsMargins(10, 10, 10, 10)
+        vbox.setSpacing(6)
 
-        # --- Detection Modes -----------------------------------------
+        # ── Detection Modes ──────────────────────────────────────────
         modes_group = QGroupBox('Detection Modes')
         modes_hbox = QHBoxLayout(modes_group)
 
@@ -44,7 +53,7 @@ class ControlFrame(BaseFrame):
         modes_hbox.addWidget(self._acoustic_btn)
         vbox.addWidget(modes_group)
 
-        # --- Engage / Stop button ------------------------------------
+        # ── Engage / Stop button ─────────────────────────────────────
         engage_font = QFont(theme.FONT_FAMILY, theme.FONT_SIZE_LARGE)
         engage_font.setBold(True)
         self.engage_button = QPushButton('Engage')
@@ -53,6 +62,86 @@ class ControlFrame(BaseFrame):
         self._apply_inactive_style()
         vbox.addWidget(self.engage_button)
 
+        # ── Settings row: port config + audio toggle ─────────────────
+        settings_row = QHBoxLayout()
+        self._port_btn = QPushButton('Serial Ports…')
+        self._port_btn.setToolTip('Configure DNN / DNE serial port assignment')
+        self._port_btn.clicked.connect(self._open_port_dialog)
+        self._audio_chk = QCheckBox('Audio')
+        self._audio_chk.setChecked(True)
+        self._audio_chk.toggled.connect(self._on_audio_toggled)
+        self._dne_aim_chk = QCheckBox('Show DNE Aim')
+        self._dne_aim_chk.setChecked(False)
+        self._dne_aim_chk.setToolTip('Show DNE targeting reticle on the zone map')
+        self._dne_aim_chk.toggled.connect(self._on_dne_aim_toggled)
+        settings_row.addWidget(self._port_btn)
+        settings_row.addStretch()
+        settings_row.addWidget(self._audio_chk)
+        settings_row.addWidget(self._dne_aim_chk)
+        vbox.addLayout(settings_row)
+
+        # ── Dwell Timer ──────────────────────────────────────────────
+        self._dwell_group = QGroupBox('Engage Dwell')
+        dwell_layout = QVBoxLayout(self._dwell_group)
+        dwell_layout.setSpacing(3)
+
+        self._dwell_engaged_lbl = QLabel('Engaged: —')
+        dwell_layout.addWidget(self._dwell_engaged_lbl)
+
+        on_target_row = QHBoxLayout()
+        self._dwell_on_target_lbl = QLabel('On Target:')
+        self._dwell_time_lbl = QLabel('0.0 / 3.0s')
+        on_target_row.addWidget(self._dwell_on_target_lbl)
+        on_target_row.addWidget(self._dwell_time_lbl)
+        dwell_layout.addLayout(on_target_row)
+
+        self._dwell_bar = QProgressBar()
+        self._dwell_bar.setRange(0, 300)   # tenths of a second × 10 (3.0s = 300)
+        self._dwell_bar.setValue(0)
+        self._dwell_bar.setTextVisible(False)
+        self._dwell_bar.setFixedHeight(14)
+        self._dwell_bar.setStyleSheet(
+            'QProgressBar { border: 1px solid #bbb; border-radius: 3px; background: #eee; }'
+            'QProgressBar::chunk { background: #4caf50; border-radius: 2px; }'
+        )
+        dwell_layout.addWidget(self._dwell_bar)
+
+        self._dwell_group.setVisible(False)   # hidden until engagement starts
+        vbox.addWidget(self._dwell_group)
+
+        # ── DNE Last Packet ──────────────────────────────────────────
+        pkt_group = QGroupBox('DNE Last Packet')
+        pkt_grid = QGridLayout(pkt_group)
+        pkt_grid.setVerticalSpacing(2)
+        pkt_grid.setHorizontalSpacing(8)
+
+        self._pkt_az    = self._pkt_val('—')
+        self._pkt_el    = self._pkt_val('—')
+        self._pkt_range = self._pkt_val('—')
+        self._pkt_laser = self._pkt_val('—')
+        self._pkt_state = self._pkt_val('—')
+        self._pkt_age   = self._pkt_val('—')
+
+        for col, (lbl, widget) in enumerate([
+            ('Az',    self._pkt_az),
+            ('El',    self._pkt_el),
+            ('Range', self._pkt_range),
+        ]):
+            pkt_grid.addWidget(QLabel(lbl + ':'), 0, col * 2)
+            pkt_grid.addWidget(widget,            0, col * 2 + 1)
+
+        for col, (lbl, widget) in enumerate([
+            ('Laser', self._pkt_laser),
+            ('State', self._pkt_state),
+            ('Age',   self._pkt_age),
+        ]):
+            pkt_grid.addWidget(QLabel(lbl + ':'), 1, col * 2)
+            pkt_grid.addWidget(widget,            1, col * 2 + 1)
+
+        vbox.addWidget(pkt_group)
+
+    #===================================================================
+    # Helpers
     #===================================================================
 
     @staticmethod
@@ -62,6 +151,30 @@ class ControlFrame(BaseFrame):
         btn.setChecked(True)
         btn.setStyleSheet(f'background-color: {theme.SENSOR_ENABLED_BG};')
         return btn
+
+    @staticmethod
+    def _pkt_val(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet('font-family: monospace;')
+        return lbl
+
+    def _open_port_dialog(self):
+        from view.frames.port_dialog import PortAssignmentDialog
+        PortAssignmentDialog(self.window(), self.controller).exec()
+
+    def _on_audio_toggled(self, checked: bool):
+        if self.controller:
+            self.controller.audio_enabled = checked
+
+    def _on_dne_aim_toggled(self, checked: bool):
+        from view.frames.map_frame import MapFrame
+        map_frame = self.window().findChild(MapFrame)
+        if map_frame:
+            map_frame.set_dne_aim_visible(checked)
+
+    #===================================================================
+    # Sensor toggles
+    #===================================================================
 
     def _on_lidar_toggled(self, checked: bool):
         self.lidar_enabled = checked
@@ -84,6 +197,75 @@ class ControlFrame(BaseFrame):
             f'background-color: {theme.SENSOR_ENABLED_BG if checked else theme.SENSOR_DISABLED_BG};')
         self.controller.set_acoustic_enabled(checked)
 
+    #===================================================================
+    # Dwell timer
+    #===================================================================
+
+    def update_dwell_display(self, engaged_secs: float | None,
+                             on_target_secs: float, dwell_goal: float):
+        """Update the dwell timer panel.
+
+        engaged_secs  — wall-clock seconds since Engage was pressed (None = not engaged)
+        on_target_secs — accumulated crosshair-on-drone seconds for the current burst
+        dwell_goal     — seconds required for a kill confirm (e.g. 3.0)
+        """
+        if engaged_secs is None:
+            self._dwell_group.setVisible(False)
+            self._dwell_bar.setValue(0)
+            return
+
+        self._dwell_group.setVisible(True)
+        self._dwell_engaged_lbl.setText(f'Engaged: {engaged_secs:.1f}s')
+
+        self._dwell_time_lbl.setText(f'{on_target_secs:.1f} / {dwell_goal:.1f}s')
+        bar_val = int(on_target_secs / dwell_goal * 300)
+        self._dwell_bar.setValue(min(bar_val, 300))
+
+        # Bar color: green → yellow → red as it fills
+        frac = on_target_secs / dwell_goal
+        if frac < 0.5:
+            chunk_color = '#4caf50'   # green
+        elif frac < 0.85:
+            chunk_color = '#ff9800'   # orange
+        else:
+            chunk_color = '#f44336'   # red
+        self._dwell_bar.setStyleSheet(
+            'QProgressBar { border: 1px solid #bbb; border-radius: 3px; background: #eee; }'
+            f'QProgressBar::chunk {{ background: {chunk_color}; border-radius: 2px; }}'
+        )
+
+    #===================================================================
+    # DNE packet readout
+    #===================================================================
+
+    def update_dne_packet(self, az: float, el: float, range_m: float,
+                          fire: int, state: int):
+        import time
+        self._last_packet_time = time.monotonic()
+        self._pkt_az.setText(f'{az:+.2f}°')
+        self._pkt_el.setText(f'{el:+.2f}°')
+        self._pkt_range.setText(f'{range_m:.1f}m')
+        laser_on = bool(fire)
+        self._pkt_laser.setText('ON' if laser_on else 'OFF')
+        self._pkt_laser.setStyleSheet(
+            f'font-family: monospace; color: {"red" if laser_on else "gray"};')
+        state_lbl = {1: 'TRACK', 2: 'ENGAGE'}.get(state, str(state))
+        self._pkt_state.setText(state_lbl)
+        self._pkt_state.setStyleSheet(
+            f'font-family: monospace; color: {"red" if state == 2 else "black"};')
+        self._pkt_age.setText('0.0s')
+
+    def _refresh_packet_age(self):
+        import time
+        if self._last_packet_time is None:
+            return
+        age = time.monotonic() - self._last_packet_time
+        self._pkt_age.setText(f'{age:.1f}s')
+        self._pkt_age.setStyleSheet(
+            f'font-family: monospace; color: {"red" if age > 2.0 else "black"};')
+
+    #===================================================================
+    # Engage button state machine
     #===================================================================
 
     def update_engage_state(self, any_in_zone3: bool):
@@ -133,7 +315,6 @@ class ControlFrame(BaseFrame):
     #===================================================================
 
     def update_engagement_active(self, active: bool):
-        """Called by controller when the engaged-RAT set gains or loses members."""
         if active == self._engagement_active:
             return
         self._engagement_active = active
@@ -141,6 +322,8 @@ class ControlFrame(BaseFrame):
             self._cancel_grace_period()
             self._apply_stop_style()
         else:
+            self._dwell_group.setVisible(False)
+            self._dwell_bar.setValue(0)
             if self._any_in_zone3 or self._grace_timer.isActive():
                 self._apply_active_style()
             else:

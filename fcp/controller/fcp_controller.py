@@ -38,9 +38,12 @@ class FCPController:
 
         self._dnn_ser: serial.SerialBase | None = None
         self._dnn_ser_lock = threading.Lock()
+        self._dnn_stop_event = threading.Event()
+        self._dnn_udp_active: bool = False   # True when running UDP fallback instead of serial
 
         self._ser: serial.SerialBase | None = None
         self._ser_lock = threading.Lock()
+        self._dne_stop_event = threading.Event()
 
         # CV engine — set by start_mode_* after CVLaunchDialog selection
         self.cv_engine   = None
@@ -56,15 +59,21 @@ class FCPController:
         # so the dwell→neutralize path can be tested without a live DNN.
         self._sim_auto_engage: bool = False
 
-        self._start_dnn_serial()
-        self._start_dne_serial()
-        self.view.after(5000, self._check_staleness)
-        self.view.after(500, self._poll_cv_state)
+        # Audio alerts — operator can toggle via control frame checkbox
+        self.audio_enabled: bool = True
+
+        # Dwell timer — wall-clock time when the current engagement started
+        self._engage_start_time: float | None = None
 
         _th = self.config['DNN.health.thresholds']
         self._thresh_battery_low      = _th.getfloat('battery_low',      20.0)
         self._thresh_battery_critical = _th.getfloat('battery_critical',  10.0)
         self._thresh_temperature_high = _th.getfloat('temperature_high',  70.0)
+
+        # Camera FOV for CV→DNE correction (degrees).
+        # Used to convert CV centroid pixel offset to az/el correction sent to DNE.
+        self._cam_hfov_deg = self.config.getfloat('cv.tuning', 'cam_hfov_deg', fallback=70.0)
+        self._cam_vfov_deg = self.config.getfloat('cv.tuning', 'cam_vfov_deg', fallback=43.0)
 
         self._dnn_last_health_time: float | None = None
         self._dnn_health_silence_threshold = 10.0  # 10× the 1 Hz health rate
@@ -78,22 +87,81 @@ class FCPController:
         config.read(config_file)
         return config
 
+    def start_connections(self):
+        """Start serial listeners and background polls.  Called after init_gui() so
+        alert_frame and other view widgets are guaranteed to exist."""
+        self._start_dnn_serial()
+        self._start_dne_serial()
+        self.view.after(5000, self._check_staleness)
+        self.view.after(500,  self._poll_cv_state)
+
     #===================================================================
+
+    def _process_dnn_message(self, data_dict: dict):
+        """Handle one parsed DNN JSON message (positional or health).  Called from
+        both the serial listener and the UDP fallback — transport-agnostic."""
+        if data_dict.get('msg_type') == 'positional':
+            rat = Rat(data_dict)
+            self._handle_rat_analytics(rat, data_dict.get('current_time'))
+            self.model.update_rat(rat)
+            self._rat_last_seen[rat.rat_id] = time.time()
+            zone_counts = {z: sum(1 for rt in self.model.rats.values() if rt.zone == z)
+                           for z in (1, 2, 3)}
+            any_z3 = zone_counts.get(3, 0) > 0
+
+            pending = self.model.pending_engage_rat_id
+            if pending and rat.rat_id == pending and rat.zone == 3:
+                self.engage_rat(pending)
+                self.model.pending_engage_rat_id = None
+
+            primary_id = self._select_primary_target()
+            self.model.primary_target_id = primary_id
+
+            def _rat_update(zc=zone_counts, rs=dict(self.model.rats), az3=any_z3,
+                            pid=primary_id, er=set(self.model.engaged_rats)):
+                self.view.control_frame.update_engage_state(az3)
+                self.view.control_frame.update_engagement_active(bool(er))
+                self.view.map_frame.update_zone_counts(zc, rs)
+                self.view.map_frame.update_engagement_state(pid, er)
+            self.view.after(0, _rat_update)
+
+            if primary_id and primary_id in self.model.rats:
+                primary_rat = self.model.rats[primary_id]
+                if primary_rat.zone >= 2:
+                    fire = 1 if primary_id in self.model.engaged_rats else 0
+                    state_cmd = 2 if fire else 1
+                    self._send_dne_targeting(primary_rat, fire=fire, state_command=state_cmd)
+
+        elif data_dict.get('msg_type') == 'health':
+            node = Node(data_dict)
+            self._dnn_last_health_time = time.time()
+            self._dnn_offline_alerted = False
+            self.view.after(0, lambda n=node: self.view.map_frame.update_dnn_node(n))
+            self._evaluate_node_health_alerts(node)
 
     def _start_dnn_serial(self):
         print(f"Connecting to DNN on {self.dnn_serial_port} @ {self.dnn_serial_baud}")
+        self._dnn_stop_event.clear()
+        self._dnn_udp_active = False
         try:
             self._dnn_ser = serial.Serial(self.dnn_serial_port, baudrate=self.dnn_serial_baud, timeout=1.0)
             print("DNN serial connection established")
+            self.view.after(0, lambda: self.view.alert_frame.add_alert(
+                f'DNN connected on {self.dnn_serial_port}', INFO))
         except Exception as e:
-            print(f"Failed to connect to DNN on {self.dnn_serial_port}: {e}")
+            print(f"Failed to connect to DNN serial on {self.dnn_serial_port}: {e}")
             self._dnn_ser = None
+            self._start_dnn_udp_fallback()
             return
 
+        stop = self._dnn_stop_event
+
         def _listen_loop(ser):
-            while True:
+            while not stop.is_set():
                 try:
                     line = ser.readline()
+                    if stop.is_set():
+                        break
                     if not line:
                         continue
                     line = line.strip()
@@ -104,79 +172,91 @@ class FCPController:
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
                         print(f"DNN serial: bad message {line!r}: {e}")
                         continue
-
-                    if data_dict.get('msg_type') == 'positional':
-                        rat = Rat(data_dict)
-                        self._handle_rat_analytics(rat, data_dict.get('current_time'))
-                        self.model.update_rat(rat)
-                        self._rat_last_seen[rat.rat_id] = time.time()
-                        zone_counts = {z: sum(1 for rt in self.model.rats.values() if rt.zone == z)
-                                       for z in (1, 2, 3)}
-                        any_z3 = zone_counts.get(3, 0) > 0
-
-                        # Check pending engagement latch before selecting primary
-                        pending = self.model.pending_engage_rat_id
-                        if pending and rat.rat_id == pending and rat.zone == 3:
-                            self.engage_rat(pending)
-                            self.model.pending_engage_rat_id = None
-
-                        primary_id = self._select_primary_target()
-                        self.model.primary_target_id = primary_id
-
-                        def _rat_update(zc=zone_counts, rs=dict(self.model.rats), az3=any_z3,
-                                        pid=primary_id, er=set(self.model.engaged_rats)):
-                            self.view.control_frame.update_engage_state(az3)
-                            self.view.control_frame.update_engagement_active(bool(er))
-                            self.view.map_frame.update_zone_counts(zc, rs)
-                            self.view.map_frame.update_engagement_state(pid, er)
-                        self.view.after(0, _rat_update)
-
-                        # Send targeting data to DNE for primary target only
-                        if primary_id and primary_id in self.model.rats:
-                            primary_rat = self.model.rats[primary_id]
-                            if primary_rat.zone >= 2:
-                                fire = 1 if primary_id in self.model.engaged_rats else 0
-                                state_cmd = 2 if fire else 1
-                                self._send_dne_targeting(primary_rat, fire=fire, state_command=state_cmd)
-
-                    elif data_dict.get('msg_type') == 'health':
-                        node = Node(data_dict)
-                        self._dnn_last_health_time = time.time()
-                        self._dnn_offline_alerted = False
-                        self.view.after(0, lambda n=node: self.view.map_frame.update_dnn_node(n))
-                        self._evaluate_node_health_alerts(node)
-
+                    self._process_dnn_message(data_dict)
                 except Exception as e:
+                    if stop.is_set():
+                        break
                     import traceback
                     print(f"DNN serial listener error: {e}")
                     traceback.print_exc()
-                    continue
 
         t = threading.Thread(target=_listen_loop, args=(self._dnn_ser,), daemon=True)
+        t.start()
+
+    def _start_dnn_udp_fallback(self):
+        """UDP listener — used automatically when the DNN serial port is unavailable.
+        Receives the same JSON messages the DNN simulator sends on port 5000.
+        Always binds 0.0.0.0 so both loopback (simulator) and field network packets arrive."""
+        import socket as _sock
+        port = self.config.getint('DNN.recv.connection', 'port', fallback=5000)
+        try:
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+            s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+            s.settimeout(1.0)
+            s.bind(('0.0.0.0', port))
+        except Exception as e:
+            self.view.after(0, lambda msg=str(e): self.view.alert_frame.add_alert(
+                f'DNN: serial unavailable and UDP fallback failed on port {port}: {msg}', ERROR))
+            return
+        self._dnn_udp_active = True
+        self.view.after(0, lambda: self.view.alert_frame.add_alert(
+            f'DNN: serial unavailable — using UDP fallback on port {port}', WARNING))
+        stop = self._dnn_stop_event
+
+        def _udp_loop():
+            while not stop.is_set():
+                try:
+                    data, _ = s.recvfrom(65535)
+                    if stop.is_set():
+                        break
+                    try:
+                        data_dict = json.loads(data.decode('utf-8'))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    self._process_dnn_message(data_dict)
+                except _sock.timeout:
+                    continue
+                except Exception as e:
+                    if stop.is_set():
+                        break
+                    print(f"DNN UDP listener error: {e}")
+            self._dnn_udp_active = False
+            s.close()
+
+        t = threading.Thread(target=_udp_loop, daemon=True)
         t.start()
 
     #===================================================================
 
     def _start_dne_serial(self):
         print(f"Connecting to DNE on {self.dne_port}")
+        self._dne_stop_event.clear()
         try:
             self._ser = serial.serial_for_url(self.dne_port, baudrate=self.dne_baud, timeout=1.0)
             print("DNE serial connection established")
+            self.model.dne_healthy = True
+            self.view.after(0, lambda: self.view.alert_frame.add_alert(
+                f'DNE connected on {self.dne_port}', INFO))
+            self.view.after(0, lambda: self.view.map_frame.update_dne_status(True, False))
         except Exception as e:
             print(f"Failed to connect to DNE on {self.dne_port}: {e}")
+            self.view.after(0, lambda msg=str(e): self.view.alert_frame.add_alert(
+                f'DNE serial failed ({self.dne_port}): {msg}', WARNING))
             self._ser = None
             return
 
-        _DNE_HEALTH_TIMEOUT = 3.0  # seconds without an echo → declare unhealthy
+        _DNE_HEALTH_TIMEOUT = 3.0
+        stop = self._dne_stop_event
 
         def _dne_listen_loop(ser):
             receiver = PacketReceiver()
             last_echo = time.time()
-            while True:
+            while not stop.is_set():
                 try:
-                    byte = ser.read(1)  # returns b'' on the 1-second serial timeout
+                    byte = ser.read(1)
+                    if stop.is_set():
+                        break
                     if not byte:
-                        # No data — check if the DNE has gone silent
                         if self.model.dne_healthy and (time.time() - last_echo > _DNE_HEALTH_TIMEOUT):
                             self.model.dne_healthy = False
                             self.model.dne_laser_firing = False
@@ -196,27 +276,117 @@ class FCPController:
                             self.view.after(0, lambda: self.view.alert_frame.add_alert(
                                 'DNE effector reconnected', INFO))
                 except Exception as e:
+                    if stop.is_set():
+                        break
                     print(f"DNE serial listener error: {e}")
-                    continue
 
         t = threading.Thread(target=_dne_listen_loop, args=(self._ser,), daemon=True)
         t.start()
 
     #===================================================================
 
-    def _send_dne_targeting(self, rat: Rat, fire: int = 0, state_command: int = 1):
-        if self._ser is None:
+    def reconnect_serial(self, dnn_port: str | None = None, dne_port: str | None = None):
+        """Close and reopen only the connection(s) whose port argument was provided."""
+        if dnn_port is not None:
+            if dnn_port != self.dnn_serial_port:
+                self.dnn_serial_port = dnn_port
+            self._dnn_stop_event.set()
+            if self._dnn_ser:
+                try:
+                    self._dnn_ser.close()
+                except Exception:
+                    pass
+                self._dnn_ser = None
+            time.sleep(0.15)
+            self._dnn_stop_event = threading.Event()
+            self._start_dnn_serial()
+
+        if dne_port is not None:
+            if dne_port != self.dne_port:
+                self.dne_port = dne_port
+            self._dne_stop_event.set()
+            if self._ser:
+                try:
+                    self._ser.close()
+                except Exception:
+                    pass
+                self._ser = None
+            time.sleep(0.15)
+            self._dne_stop_event = threading.Event()
+            self._start_dne_serial()
+
+    #===================================================================
+
+    def _send_cv_corrected_targeting(self, rat: Rat, cv_meta: dict, rat_id: str) -> None:
+        """Refine DNE aiming using CV centroid offset from laser center.
+
+        Converts the pixel-space gimbal error into az/el degrees and adds it
+        on top of the DNN's coarse measurement before sending to the DNE.
+        Only called when CV is LOCKED/DARK LOCK on a zone-3 RAT.
+        """
+        cx = cv_meta.get('cx', 0)
+        cy = cv_meta.get('cy', 0)
+        fw = cv_meta.get('frame_w', 640)
+        fh = cv_meta.get('frame_h', 480)
+        if fw == 0 or fh == 0:
             return
-        try:
-            t = Target(
-                rat.az_value, rat.el_value, rat.range_value,
-                rat.az_rate, rat.el_rate, rat.range_rate,
-                fire, state_command,
-            )
-            with self._ser_lock:
-                self._ser.write(make_packet(t))
-        except Exception as e:
-            print(f"Failed to send DNE targeting: {e}")
+
+        # Pixel offset of tracked centroid from frame/laser centre.
+        # +delta_x → target is right of centre → need to increase az.
+        # +delta_y → target is below centre   → need to decrease el (y-axis flipped).
+        delta_x = cx - fw // 2
+        delta_y = cy - fh // 2
+        daz =  delta_x * self._cam_hfov_deg / fw
+        del_ = -delta_y * self._cam_vfov_deg / fh
+
+        fire      = 1 if rat_id in self.model.engaged_rats else 0
+        state_cmd = 2 if fire else 1
+        corrected = Rat({
+            'rat_id': rat.rat_id, 'zone': rat.zone,
+            'values': {'az_value':    rat.az_value    + daz,
+                       'el_value':    rat.el_value    + del_,
+                       'range_value': rat.range_value},
+            'rates':  {'az_rate':    rat.az_rate,
+                       'el_rate':    rat.el_rate,
+                       'range_rate': rat.range_rate},
+        })
+        self._send_dne_targeting(corrected, fire=fire, state_command=state_cmd)
+
+    #===================================================================
+
+    def _beep(self, n: int = 1):
+        """Play n system beeps on a background thread (non-blocking)."""
+        if not self.audio_enabled:
+            return
+        def _do():
+            from PyQt6.QtWidgets import QApplication
+            for i in range(n):
+                QApplication.beep()
+                if i < n - 1:
+                    time.sleep(0.18)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _send_dne_targeting(self, rat: Rat, fire: int = 0, state_command: int = 1,
+                            hit_confirmation: int = 0):
+        if self._ser is not None:
+            try:
+                t = Target(
+                    rat.az_value, rat.el_value, rat.range_value,
+                    rat.az_rate, rat.el_rate, rat.range_rate,
+                    fire, state_command,
+                    hit_confirmation=hit_confirmation,
+                    time=int(time.time() * 1000),
+                )
+                with self._ser_lock:
+                    self._ser.write(make_packet(t))
+            except Exception as e:
+                print(f"Failed to send DNE targeting: {e}")
+        # Update map reticle and control-frame packet readout regardless of serial state
+        az, el, rng, sc = rat.az_value, rat.el_value, rat.range_value, state_command
+        self.view.after(0, lambda: (
+            self.view.map_frame.update_dne_aim(az, el, rng),
+            self.view.control_frame.update_dne_packet(az, el, rng, fire, sc),
+        ))
 
     #===================================================================
 
@@ -250,6 +420,8 @@ class FCPController:
             if rat.zone > prev_zone:
                 sev = WARNING
                 msg = f'RAT {rat.rat_id} entered {zone_label}'
+                if rat.zone == 3:
+                    self._beep(2)   # two beeps — zone 3, engage is now possible
             else:
                 sev = INFO
                 msg = f'RAT {rat.rat_id} withdrew to {zone_label}'
@@ -351,7 +523,7 @@ class FCPController:
 
     #===================================================================
 
-    _ENGAGE_DWELL_S = 2.0   # seconds of continuous on-target required for a confirmed kill
+    _ENGAGE_DWELL_S = 3.0   # seconds of continuous on-target crosshair lock for kill confirm
 
     def _poll_cv_state(self):
         """Poll the CV engine metadata every 100 ms, update model, fire state-change alerts."""
@@ -390,6 +562,12 @@ class FCPController:
                 f'CV tracker: {prev_state} → {new_state}',
                 _SEV.get(new_state, INFO))
 
+        if new_state == 'LOCKED' and prev_state != 'LOCKED':
+            # Only beep if the drone is already in zone 3 — lock on a distant RAT isn't actionable
+            any_z3 = any(r.zone == 3 for r in self.model.rats.values())
+            if any_z3:
+                self._beep(1)
+
         # Log CV confidence each time tracker acquires LOCKED state (immediate, not debounced)
         if new_state == 'LOCKED' and prev_state != 'LOCKED':
             self.model.analytics_db.log_rat_event(
@@ -397,8 +575,11 @@ class FCPController:
             if self._sim_auto_engage and not self.model.engaged_rats:
                 self._inject_sim_rat()
 
-        # Dwell-based kill confirmation: accumulate on-target time per engaged RAT
+        # Dwell-based kill confirmation: accumulate on-target crosshair time per engaged RAT.
+        # Requires strict LOCKED (not DARK LOCK) + centroid inside engage radius for 3 continuous seconds.
         on_target = meta.get('on_target', False)
+        max_dwell_progress = 0.0
+        max_dwell_secs = 0.0
         for rat_id in list(self.model.engaged_rats):
             if on_target and new_state == 'LOCKED':
                 self._engage_dwell[rat_id] = self._engage_dwell.get(rat_id, 0.0) + 0.1
@@ -406,6 +587,21 @@ class FCPController:
                     self._neutralize_rat(rat_id)
             else:
                 self._engage_dwell[rat_id] = 0.0   # reset if off-target or lock lost
+            d = self._engage_dwell.get(rat_id, 0.0)
+            frac = min(1.0, d / self._ENGAGE_DWELL_S)
+            if frac > max_dwell_progress:
+                max_dwell_progress = frac
+                max_dwell_secs = d
+        # Push progress to CV engine (arc on video) and dwell panel in control frame
+        if self.cv_engine is not None:
+            self.cv_engine.set_dwell_progress(max_dwell_progress)
+        engaged_elapsed = (
+            time.monotonic() - self._engage_start_time
+            if self._engage_start_time is not None and self.model.engaged_rats
+            else None
+        )
+        self.view.after(0, lambda e=engaged_elapsed, d=max_dwell_secs:
+            self.view.control_frame.update_dwell_display(e, d, self._ENGAGE_DWELL_S))
 
         # Visual hit confirmation: scan raw frame for green laser dot on drone body
         if self._hit_confirm is not None and self.model.engaged_rats:
@@ -426,6 +622,13 @@ class FCPController:
                     self._hit_confirm.reset()   # reset so it can re-confirm on next hit
             elif new_state == 'SEARCHING':
                 self._hit_confirm.reset()
+
+        # CV fine-tuning: when locked on a zone-3 target, refine DNE aiming
+        # using the centroid pixel offset rather than raw DNN az/el alone.
+        if new_state in ('LOCKED', 'DARK LOCK'):
+            pid = self.model.primary_target_id
+            if pid and pid in self.model.rats and self.model.rats[pid].zone == 3:
+                self._send_cv_corrected_targeting(self.model.rats[pid], meta, pid)
 
         self.view.after(100, self._poll_cv_state)   # reschedule
 
@@ -531,9 +734,17 @@ class FCPController:
             self.model.pending_engage_rat_id = None
         self._engage_dwell.pop(rat_id, None)
         self._hit_confirm = None
+        self._engage_start_time = None
+        if self.cv_engine is not None:
+            self.cv_engine.set_dwell_progress(0.0)
+        self.view.after(0, lambda: self.view.control_frame.update_dwell_display(None, 0.0, self._ENGAGE_DWELL_S))
+        rat = self.model.rats.get(rat_id)
+        if rat:
+            self._send_dne_targeting(rat, fire=0, state_command=1, hit_confirmation=1)
         self._send_hit_confirmation(rat_id)
         self.model.analytics_db.log_rat_event(rat_id, 'neutralized')
         self.view.alert_frame.add_alert(f'RAT {rat_id} NEUTRALIZED', INFO)
+        self._beep(3)   # three beeps — kill confirmed
         primary_id = self._select_primary_target()
         self.model.primary_target_id = primary_id
         self.view.after(0, lambda p=primary_id, e=set(self.model.engaged_rats):
@@ -672,6 +883,7 @@ class FCPController:
         """Engage a specific RAT — log to DB and send fire command to DNE."""
         print(f"Engaged RAT: {rat_id}")
         self._hit_confirm = HitConfirmEngine()
+        self._engage_start_time = time.monotonic()
         self.model.analytics_db.log_rat_event(rat_id, 'engage_commanded')
         self.model.engaged_rats.add(rat_id)
         if self.cv_engine is not None and hasattr(self.cv_engine, 'set_engaged'):
@@ -716,6 +928,8 @@ class FCPController:
         was_engaged = pid in self.model.engaged_rats
         self.model.engaged_rats.discard(pid)
         self._hit_confirm = None
+        self._engage_start_time = None
+        self.view.after(0, lambda: self.view.control_frame.update_dwell_display(None, 0.0, self._ENGAGE_DWELL_S))
         if self.cv_engine is not None and hasattr(self.cv_engine, 'set_engaged'):
             self.cv_engine.set_engaged(bool(self.model.engaged_rats))
         self.model.pending_engage_rat_id = None

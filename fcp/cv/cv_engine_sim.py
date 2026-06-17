@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 
 from cv.cv_draw import Config, _draw_hud, _draw_trail, _draw_zoom_inset, compute_laser_pos
+from cv.cv_engine_base import CVEngineBase
 
 
 _STATE_CYCLE = ["SEARCHING", "LOCKED", "DARK LOCK", "PREDICTING"]
@@ -42,7 +43,7 @@ _STATE_COLORS = {
 }
 
 
-class CVEngineSimulator:
+class CVEngineSimulator(CVEngineBase):
     """
     Simulated CV engine.  Drop-in replacement for the future TRT-based engine.
 
@@ -72,6 +73,7 @@ class CVEngineSimulator:
         self._paused             = False
         self._last_frame: np.ndarray | None = None
         self._thread: threading.Thread | None = None
+        self._dwell_progress: float = 0.0
 
     # ── Public interface ──────────────────────────────────────────
 
@@ -116,6 +118,9 @@ class CVEngineSimulator:
 
     def restart_video(self) -> None:
         self._restart_video_evt.set()
+
+    def set_dwell_progress(self, frac: float) -> None:
+        self._dwell_progress = max(0.0, min(1.0, frac))
 
     def get_raw_frame(self) -> np.ndarray | None:
         """The simulator doesn't separate raw from annotated; return last frame."""
@@ -248,6 +253,7 @@ class CVEngineSimulator:
                 vx=vx, vy=vy,
                 dark_blobs=[], sky_ref=180,
                 arduino_ok=False, cfg=self._cfg,
+                dwell_progress=self._dwell_progress,
             )
 
             if self._cfg.SHOW_ZOOM_INSET and status in ("LOCKED", "DARK LOCK"):
