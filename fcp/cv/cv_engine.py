@@ -37,6 +37,12 @@ def _camera_worker_proc(cam_idx, fourcc_str, req_w, req_h, fps,
     libjpeg SIGSEGV / SIGABRT from corrupted MJPG data crash only this child;
     the parent FCP process is completely unaffected.
     """
+    # libjpeg writes "Corrupt JPEG data: premature end of data segment" straight
+    # to fd 2 from C — expected over a USB extender/usbipd link, not a Python
+    # warning, so silencing requires an OS-level fd redirect, not logging config.
+    _devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_devnull, 2)
+
     import cv2
     import numpy as np
 
@@ -294,16 +300,16 @@ class CVEngine:
                     f"Run in PowerShell (Admin):  usbipd attach --wsl --busid <ID>")
                 return
             # Try formats in order until frames actually arrive.
-            # YUYV (uncompressed) is listed first: no JPEG decoding means no
-            # libjpeg crashes from truncated frames over WSL2 USB passthrough.
-            # MJPG is tried last as a fallback for cameras that don't do YUYV.
+            # MJPG 640x480@30fps is listed first — it's the mode that actually
+            # works on the field camera/USB extender; YUYV never negotiates
+            # frames on that hardware and just wastes probe time (~5s/attempt).
             _candidates = [
-                ('YUYV',  640, 480, 30),
-                ('YUYV',  640, 480, 15),
-                ('YUYV',  320, 240, 30),
                 ('MJPG',  640, 480, 30),
                 ('MJPG',  640, 480, 15),
                 ('MJPG',  320, 240, 30),
+                ('YUYV',  640, 480, 30),
+                ('YUYV',  640, 480, 15),
+                ('YUYV',  320, 240, 30),
                 (None,    640, 480, 15),   # let driver pick
             ]
             live_cap      = None

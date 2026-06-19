@@ -6,13 +6,14 @@ maps to the DNN detector and the DNE effector, then reconnects live.
 """
 
 import glob
+import threading
 import serial.tools.list_ports
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QComboBox, QPushButton, QLabel,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 
 
@@ -25,12 +26,19 @@ def _available_ports() -> list[str]:
 
 
 class PortAssignmentDialog(QDialog):
+    # USB enumeration (serial.tools.list_ports.comports()) can hang for several
+    # seconds — or indefinitely — if a USB device is wedged in an error state
+    # on the bus.  Run it on a background thread so the dialog (and the rest
+    # of the app, which shares the Qt event loop) never freezes because of it.
+    _ports_ready = pyqtSignal(list)
+
     def __init__(self, parent, controller):
         super().__init__(parent)
         self.controller = controller
         self.setWindowTitle('Serial Port Assignment')
         self.setModal(True)
         self.setMinimumWidth(460)
+        self._ports_ready.connect(self._on_ports_ready)
         self._build_ui()
         self._refresh_ports()
 
@@ -85,8 +93,8 @@ class PortAssignmentDialog(QDialog):
 
         # ── Buttons ────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        refresh_btn = QPushButton('Refresh Ports')
-        refresh_btn.clicked.connect(self._refresh_ports)
+        self._refresh_btn = QPushButton('Refresh Ports')
+        self._refresh_btn.clicked.connect(self._refresh_ports)
 
         self._dnn_only_btn = QPushButton('Reconnect DNN')
         self._dnn_only_btn.clicked.connect(self._reconnect_dnn)
@@ -101,7 +109,7 @@ class PortAssignmentDialog(QDialog):
         close_btn = QPushButton('Close')
         close_btn.clicked.connect(self.accept)
 
-        btn_row.addWidget(refresh_btn)
+        btn_row.addWidget(self._refresh_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._dnn_only_btn)
         btn_row.addWidget(self._dne_only_btn)
@@ -114,7 +122,18 @@ class PortAssignmentDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _refresh_ports(self):
-        ports = _available_ports()
+        self._refresh_btn.setEnabled(False)
+        self._refresh_btn.setText('Scanning…')
+        threading.Thread(target=self._scan_ports_bg, daemon=True).start()
+
+    def _scan_ports_bg(self):
+        try:
+            ports = _available_ports()
+        except Exception:
+            ports = []
+        self._ports_ready.emit(ports)   # queued back to the GUI thread automatically
+
+    def _on_ports_ready(self, ports: list[str]):
         for combo, attr in ((self._dnn_combo, 'dnn_serial_port'),
                             (self._dne_combo, 'dne_port')):
             current = combo.currentText() or getattr(self.controller, attr, '')
@@ -122,6 +141,8 @@ class PortAssignmentDialog(QDialog):
             combo.addItems(ports)
             idx = combo.findText(current)
             combo.setCurrentIndex(max(idx, 0))
+        self._refresh_btn.setEnabled(True)
+        self._refresh_btn.setText('Refresh Ports')
 
     def _update_status_labels(self):
         dnn_serial_ok = self.controller._dnn_ser is not None
@@ -167,6 +188,19 @@ class PortAssignmentDialog(QDialog):
         self._update_status_labels()
 
     def _apply_sim_mode(self):
-        """Connect DNE to the local simulator TCP server.  DNN falls back to UDP automatically."""
-        self.controller.reconnect_serial(dne_port='socket://127.0.0.1:6000')
+        """Connect DNE to the local simulator TCP server.
+
+        Also reconnects DNN on its configured hardware port (e.g. /dev/ttyACM0)
+        rather than leaving whatever port was last selected in the dropdown —
+        if real DNN hardware is attached there, this finds it normally; if not,
+        the attempt fails and falls back to UDP automatically, same as on
+        startup. Without this, a stray leftover port (e.g. a /dev/pts/* pty
+        selected during earlier testing) can "succeed" at opening — since the
+        path exists — even though nothing meaningful is on the other end,
+        which silently blocks the UDP fallback from ever starting.
+        """
+        default_dnn_port = self.controller.config.get(
+            'DNN.serial', 'port', fallback='/dev/ttyACM0')
+        self.controller.reconnect_serial(
+            dnn_port=default_dnn_port, dne_port='socket://127.0.0.1:6000')
         self._update_status_labels()

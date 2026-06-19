@@ -33,8 +33,8 @@ class ControlFrame(BaseFrame):
 
     def create_widgets(self):
         vbox = QVBoxLayout(self)
-        vbox.setContentsMargins(10, 10, 10, 10)
-        vbox.setSpacing(6)
+        vbox.setContentsMargins(8, 8, 8, 8)
+        vbox.setSpacing(4)
 
         # ── Detection Modes ──────────────────────────────────────────
         modes_group = QGroupBox('Detection Modes')
@@ -84,16 +84,15 @@ class ControlFrame(BaseFrame):
         self._dwell_group = QGroupBox('Engage Dwell')
         dwell_layout = QVBoxLayout(self._dwell_group)
         dwell_layout.setSpacing(3)
+        dwell_layout.setContentsMargins(8, 4, 8, 6)
 
+        status_row = QHBoxLayout()
         self._dwell_engaged_lbl = QLabel('Engaged: —')
-        dwell_layout.addWidget(self._dwell_engaged_lbl)
-
-        on_target_row = QHBoxLayout()
-        self._dwell_on_target_lbl = QLabel('On Target:')
-        self._dwell_time_lbl = QLabel('0.0 / 3.0s')
-        on_target_row.addWidget(self._dwell_on_target_lbl)
-        on_target_row.addWidget(self._dwell_time_lbl)
-        dwell_layout.addLayout(on_target_row)
+        self._dwell_time_lbl = QLabel('On Target: 0.0 / 3.0s')
+        status_row.addWidget(self._dwell_engaged_lbl)
+        status_row.addStretch()
+        status_row.addWidget(self._dwell_time_lbl)
+        dwell_layout.addLayout(status_row)
 
         self._dwell_bar = QProgressBar()
         self._dwell_bar.setRange(0, 300)   # tenths of a second × 10 (3.0s = 300)
@@ -109,9 +108,13 @@ class ControlFrame(BaseFrame):
         self._dwell_group.setVisible(False)   # hidden until engagement starts
         vbox.addWidget(self._dwell_group)
 
-        # ── DNE Last Packet ──────────────────────────────────────────
+        # ── DNE Last Packet (+ Manual Test, same box to save vertical space) ──
         pkt_group = QGroupBox('DNE Last Packet')
-        pkt_grid = QGridLayout(pkt_group)
+        pkt_vbox = QVBoxLayout(pkt_group)
+        pkt_vbox.setSpacing(4)
+        pkt_vbox.setContentsMargins(8, 4, 8, 6)
+
+        pkt_grid = QGridLayout()
         pkt_grid.setVerticalSpacing(2)
         pkt_grid.setHorizontalSpacing(8)
 
@@ -137,6 +140,22 @@ class ControlFrame(BaseFrame):
         ]):
             pkt_grid.addWidget(QLabel(lbl + ':'), 1, col * 2)
             pkt_grid.addWidget(widget,            1, col * 2 + 1)
+
+        pkt_vbox.addLayout(pkt_grid)
+
+        # ── Manual DNE Test (bench/field test without DNN connected) ──
+        test_row = QHBoxLayout()
+        test_row.addWidget(QLabel('Manual Test:'))
+        self._test_laser_btn = QPushButton('Test Laser: OFF')
+        self._test_laser_btn.setCheckable(True)
+        self._test_laser_btn.setToolTip(
+            'Fires the DNE laser directly with az=el=range=0, bypassing\n'
+            'engagement/dwell logic entirely. Works with no DNN connected —\n'
+            'use to bench-test the DNE link before the detector is online.')
+        self._test_laser_btn.setStyleSheet('background-color: #ccc;')
+        self._test_laser_btn.toggled.connect(self._on_test_laser_toggled)
+        test_row.addWidget(self._test_laser_btn, 1)
+        pkt_vbox.addLayout(test_row)
 
         vbox.addWidget(pkt_group)
 
@@ -171,6 +190,13 @@ class ControlFrame(BaseFrame):
         map_frame = self.window().findChild(MapFrame)
         if map_frame:
             map_frame.set_dne_aim_visible(checked)
+
+    def _on_test_laser_toggled(self, checked: bool):
+        self._test_laser_btn.setText(f'Test Laser: {"ON" if checked else "OFF"}')
+        self._test_laser_btn.setStyleSheet(
+            'background-color: #f44336; color: white;' if checked else 'background-color: #ccc;')
+        if self.controller:
+            self.controller.test_dne_laser(checked)
 
     #===================================================================
     # Sensor toggles
@@ -217,7 +243,7 @@ class ControlFrame(BaseFrame):
         self._dwell_group.setVisible(True)
         self._dwell_engaged_lbl.setText(f'Engaged: {engaged_secs:.1f}s')
 
-        self._dwell_time_lbl.setText(f'{on_target_secs:.1f} / {dwell_goal:.1f}s')
+        self._dwell_time_lbl.setText(f'On Target: {on_target_secs:.1f} / {dwell_goal:.1f}s')
         bar_val = int(on_target_secs / dwell_goal * 300)
         self._dwell_bar.setValue(min(bar_val, 300))
 
@@ -318,6 +344,11 @@ class ControlFrame(BaseFrame):
         if active == self._engagement_active:
             return
         self._engagement_active = active
+        # A real engagement takes priority over the bench test — don't let both
+        # fight over the laser/state-command fields in the same DNE packet.
+        self._test_laser_btn.setEnabled(not active)
+        if active and self._test_laser_btn.isChecked():
+            self._test_laser_btn.setChecked(False)
         if active:
             self._cancel_grace_period()
             self._apply_stop_style()

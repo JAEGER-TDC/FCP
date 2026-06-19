@@ -1,6 +1,5 @@
 import sys
 import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QLineEdit, QTextEdit
 from PyQt6.QtCore import Qt, QTimer

@@ -109,6 +109,7 @@ class PacketReceiver:
         self._length    = 0
         self._buffer    = bytearray()
         self._crc_bytes = bytearray()
+        self.crc_errors = 0   # exposed for diagnostics — distinguishes "garbled" from "silent"
 
     def process_byte(self, byte: int):
         """Feed one byte.  Returns a Target when a valid complete packet arrives, else None."""
@@ -136,6 +137,7 @@ class PacketReceiver:
                 self._state = "WAIT_HEADER"
                 if recv_crc == calc_crc:
                     return Target.unpack(bytes(self._buffer))
+                self.crc_errors += 1
                 print(f"[DNE] CRC mismatch: got {recv_crc:#06x}, expected {calc_crc:#06x}")
                 return None
 

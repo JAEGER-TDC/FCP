@@ -42,7 +42,9 @@
       "Bash(git -C /home/lockheed/FCP checkout DustinEdits)",
       "Bash(python3 -c \"import struct; print\\(struct.calcsize\\('<6f3BQ'\\)\\)\")",
       "Bash(mkdir /home/lockheed/FCP/fcp/protocol)",
-      "Bash(python3 -c \"import serial.tools.list_ports; print\\('ok'\\)\")"
+      "Bash(python3 -c \"import serial.tools.list_ports; print\\('ok'\\)\")",
+      "Bash(cat)",
+      "Bash(rm /home/lockheed/FCP/simulators/dne_sim/pathcheck.py)"
     ],
     "additionalDirectories": [
       "/home/lockheed/.claude/plans",

@@ -79,6 +79,19 @@ class FCPController:
         self._dnn_health_silence_threshold = 10.0  # 10× the 1 Hz health rate
         self._dnn_offline_alerted: bool = False
 
+        # DNE health is confirmed only by an echoed packet, but real targeting
+        # packets are only sent while a RAT is in zone>=2 — with no RAT present
+        # the link would otherwise be wrongly flagged unhealthy after 3s of
+        # legitimate silence. Track last-send time so an idle keepalive can
+        # fill the gap and keep the health check honest.
+        self._last_dne_send_time: float = 0.0
+
+        # Manual bench/field test — fires the DNE laser with no DNN/RAT data
+        # required. Kept separate from engaged_rats so it can't be confused
+        # with a real engagement; the keepalive re-sends this state instead
+        # of going idle so the laser doesn't drop after ~1s.
+        self._test_laser_on: bool = False
+
     #===================================================================
 
     def read_config(self, config_file):
@@ -94,6 +107,7 @@ class FCPController:
         self._start_dne_serial()
         self.view.after(5000, self._check_staleness)
         self.view.after(500,  self._poll_cv_state)
+        self.view.after(1000, self._poll_dne_keepalive)
 
     #===================================================================
 
@@ -243,6 +257,12 @@ class FCPController:
             self.view.after(0, lambda msg=str(e): self.view.alert_frame.add_alert(
                 f'DNE serial failed ({self.dne_port}): {msg}', WARNING))
             self._ser = None
+            # A prior connection may have left dne_healthy=True — make sure a
+            # failed (re)connect attempt is reflected immediately rather than
+            # leaving the GUI showing a stale "HEALTHY" from before.
+            self.model.dne_healthy = False
+            self.model.dne_laser_firing = False
+            self.view.after(0, lambda: self.view.map_frame.update_dne_status(False, False))
             return
 
         _DNE_HEALTH_TIMEOUT = 3.0
@@ -251,6 +271,8 @@ class FCPController:
         def _dne_listen_loop(ser):
             receiver = PacketReceiver()
             last_echo = time.time()
+            total_bytes_rx = 0   # diagnostic: tells us whether anything is on the wire at all
+
             while not stop.is_set():
                 try:
                     byte = ser.read(1)
@@ -261,9 +283,22 @@ class FCPController:
                             self.model.dne_healthy = False
                             self.model.dne_laser_firing = False
                             self.view.after(0, lambda: self.view.map_frame.update_dne_status(False, False))
-                            self.view.after(0, lambda: self.view.alert_frame.add_alert(
-                                'DNE effector offline or unresponsive', ERROR))
+                            # Distinguish "nothing on the wire" (wiring/power/TX line) from
+                            # "bytes arriving but garbled" (baud rate / protocol mismatch) —
+                            # both look identical as a bare "offline" message otherwise.
+                            if total_bytes_rx == 0:
+                                msg = (f'DNE: zero bytes received on {self.dne_port} '
+                                      f'@ {self.dne_baud} baud — check wiring/power/TX line')
+                            elif receiver.crc_errors > 0:
+                                msg = (f'DNE: {total_bytes_rx} bytes received, '
+                                      f'{receiver.crc_errors} failed CRC — check baud rate '
+                                      f'({self.dne_baud}) and protocol framing')
+                            else:
+                                msg = (f'DNE: {total_bytes_rx} bytes received but no valid '
+                                      f'packet header found — check baud rate ({self.dne_baud})')
+                            self.view.after(0, lambda m=msg: self.view.alert_frame.add_alert(m, ERROR))
                         continue
+                    total_bytes_rx += len(byte)
                     result = receiver.process_byte(byte[0])
                     if result is not None:
                         last_echo = time.time()
@@ -379,6 +414,7 @@ class FCPController:
                 )
                 with self._ser_lock:
                     self._ser.write(make_packet(t))
+                self._last_dne_send_time = time.time()
             except Exception as e:
                 print(f"Failed to send DNE targeting: {e}")
         # Update map reticle and control-frame packet readout regardless of serial state
@@ -387,6 +423,61 @@ class FCPController:
             self.view.map_frame.update_dne_aim(az, el, rng),
             self.view.control_frame.update_dne_packet(az, el, rng, fire, sc),
         ))
+
+    def _poll_dne_keepalive(self):
+        """Send an idle (or test-laser) targeting packet when nothing real has
+        gone out recently.
+
+        DNE health is only confirmed by an echoed packet, but real targeting
+        traffic is target-driven — with no RAT in range, legitimate silence
+        would otherwise trip the 3s health timeout and falsely report the
+        DNE as unhealthy/offline. While the manual laser test is active, this
+        re-sends the test-fire state instead of going idle, so the laser
+        doesn't drop ~1s after the operator turns it on.
+        """
+        if self._ser is not None and time.time() - self._last_dne_send_time > 1.0:
+            if self._test_laser_on:
+                self._dne_send_test_packet()
+            else:
+                try:
+                    t = Target(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 1,
+                              time=int(time.time() * 1000))
+                    with self._ser_lock:
+                        self._ser.write(make_packet(t))
+                    self._last_dne_send_time = time.time()
+                except Exception as e:
+                    print(f"Failed to send DNE keepalive: {e}")
+        self.view.after(1000, self._poll_dne_keepalive)
+
+    #===================================================================
+
+    def test_dne_laser(self, on: bool) -> None:
+        """Manually fire/stop the DNE laser with no DNN connected and no RAT
+        tracked — for bench/field testing the DNE link before the detector
+        is online. Bypasses engagement, dwell, and hit-confirm entirely."""
+        self._test_laser_on = on
+        if self._ser is None:
+            self.view.alert_frame.add_alert('DNE not connected — cannot test laser', WARNING)
+            return
+        self._dne_send_test_packet()
+        self.view.alert_frame.add_alert(f'[TEST] DNE laser {"ON" if on else "OFF"}', WARNING)
+
+    def _dne_send_test_packet(self) -> None:
+        if self._ser is None:
+            return
+        fire      = 1 if self._test_laser_on else 0
+        state_cmd = 2 if self._test_laser_on else 1
+        try:
+            t = Target(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, fire, state_cmd,
+                      time=int(time.time() * 1000))
+            with self._ser_lock:
+                self._ser.write(make_packet(t))
+            self._last_dne_send_time = time.time()
+        except Exception as e:
+            print(f"Failed to send DNE test packet: {e}")
+            return
+        self.view.after(0, lambda: self.view.control_frame.update_dne_packet(
+            0.0, 0.0, 0.0, fire, state_cmd))
 
     #===================================================================
 
