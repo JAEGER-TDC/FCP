@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy, QWidget,
-    QPushButton, QFrame, QGridLayout,
+    QPushButton, QFrame, QGridLayout, QTabWidget,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont, QColor
@@ -79,7 +79,16 @@ class VideoFrame(BaseFrame):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(200, 150)
 
-        root = QHBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._tabs = QTabWidget()
+        outer.addWidget(self._tabs)
+
+        # ── Tab 0: DNE Camera — existing CV view, unchanged ─────────────
+        cv_tab = QWidget()
+        root = QHBoxLayout(cv_tab)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
@@ -197,6 +206,15 @@ class VideoFrame(BaseFrame):
         right_vbox.addWidget(self._scope_label, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         root.addWidget(self._right_panel)
+
+        self._tabs.addTab(cv_tab, 'DNE Camera')
+
+        # ── Tab 1: Overwatch — raw field-view camera, no CV, no inference ──
+        from view.frames.overwatch_frame import OverwatchFrame
+        self._overwatch_frame = OverwatchFrame(self)
+        self._tabs.addTab(self._overwatch_frame, 'Overwatch')
+
+        self._tabs.currentChanged.connect(self._on_tab_changed)
 
         # ── Pause overlay (floats over the whole VideoFrame) ───────────
         self._pause_overlay = QWidget(self)
@@ -323,39 +341,47 @@ class VideoFrame(BaseFrame):
         self._scope_zoom = _ZOOM_LEVELS[(idx + 1) % len(_ZOOM_LEVELS)]
         self._zoom_btn.setText(f'{self._scope_zoom:.1f}x')
 
-    def update_scope(self, raw_frame, cx: int, cy: int, state: str) -> None:
-        if raw_frame is None:
-            return
+    def _render_scope_pixmap(self, raw_frame, cx: int, cy: int, state: str,
+                             out_px: int) -> QPixmap | None:
+        """Crop+annotate a square scope view at the given target pixel size."""
         h, w = raw_frame.shape[:2]
         if state == 'SEARCHING' or cx == 0:
             cx, cy = w // 2, h // 2
 
         # Compute crop radius from current zoom level
-        radius = max(4, int(_SCOPE_PX / (2 * self._scope_zoom)))
+        radius = max(4, int(out_px / (2 * self._scope_zoom)))
 
         x0 = max(0, cx - radius);  x1 = min(w, cx + radius)
         y0 = max(0, cy - radius);  y1 = min(h, cy + radius)
         if x1 <= x0 or y1 <= y0:
-            return
-
-        lw = lh = _SCOPE_PX   # always square
+            return None
 
         crop  = raw_frame[y0:y1, x0:x1]
-        scope = cv2.resize(crop, (lw, lh), interpolation=cv2.INTER_LINEAR)
+        scope = cv2.resize(crop, (out_px, out_px), interpolation=cv2.INTER_LINEAR)
 
-        # Crosshair
-        ic_x, ic_y = lw // 2, lh // 2
-        cv2.line(scope, (ic_x - 16, ic_y), (ic_x + 16, ic_y), (0, 255, 255), 1, cv2.LINE_AA)
-        cv2.line(scope, (ic_x, ic_y - 16), (ic_x, ic_y + 16), (0, 255, 255), 1, cv2.LINE_AA)
-        cv2.circle(scope, (ic_x, ic_y), 8, (0, 0, 255), 1, cv2.LINE_AA)
+        # Crosshair — scaled relative to output size so it looks right at any size
+        ic_x = ic_y = out_px // 2
+        arm  = max(8, out_px // 12)
+        lw_  = max(1, out_px // 200)
+        cv2.line(scope, (ic_x - arm, ic_y), (ic_x + arm, ic_y), (0, 255, 255), lw_, cv2.LINE_AA)
+        cv2.line(scope, (ic_x, ic_y - arm), (ic_x, ic_y + arm), (0, 255, 255), lw_, cv2.LINE_AA)
+        cv2.circle(scope, (ic_x, ic_y), max(4, arm // 2), (0, 0, 255), lw_, cv2.LINE_AA)
 
         # Colored border
         border_bgr = _STATE_COLOURS.get(state, (100, 100, 100))
-        cv2.rectangle(scope, (1, 1), (lw - 2, lh - 2), border_bgr, 2)
+        cv2.rectangle(scope, (1, 1), (out_px - 2, out_px - 2), border_bgr, max(2, out_px // 150))
 
         scope_rgb = cv2.cvtColor(scope, cv2.COLOR_BGR2RGB)
-        img = QImage(scope_rgb.data, lw, lh, lw * 3, QImage.Format.Format_RGB888)
-        self._scope_label.setPixmap(QPixmap.fromImage(img))
+        img = QImage(scope_rgb.data, out_px, out_px, out_px * 3, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(img)
+
+    def update_scope(self, raw_frame, cx: int, cy: int, state: str) -> None:
+        if raw_frame is None:
+            return
+
+        sidebar_px = self._render_scope_pixmap(raw_frame, cx, cy, state, _SCOPE_PX)
+        if sidebar_px is not None:
+            self._scope_label.setPixmap(sidebar_px)
 
     def _update_scope_from_engine(self) -> None:
         if self._cv_engine is None:
@@ -364,6 +390,16 @@ class VideoFrame(BaseFrame):
         meta = self._cv_engine.get_metadata()
         self.update_scope(raw, meta.get('cx', 0), meta.get('cy', 0),
                           meta.get('state', 'SEARCHING'))
+
+    # ------------------------------------------------------------------
+    # Tab switching — Overwatch only streams while its tab is active
+    # ------------------------------------------------------------------
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self._tabs.widget(index) is self._overwatch_frame:
+            self._overwatch_frame.start()
+        else:
+            self._overwatch_frame.stop()
 
     # ------------------------------------------------------------------
     # Resize

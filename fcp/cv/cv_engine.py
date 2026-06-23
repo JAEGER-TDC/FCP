@@ -16,152 +16,12 @@ import os
 import time
 import queue
 import threading
-import ctypes as _ct
-import multiprocessing as _mp
 from collections import deque
 
 import cv2
 import numpy as np
 
-
-# ---------------------------------------------------------------------------
-# Camera capture subprocess
-# ---------------------------------------------------------------------------
-# Top-level function so multiprocessing can pickle it for 'spawn'.
-
-def _camera_worker_proc(cam_idx, fourcc_str, req_w, req_h, fps,
-                        shared_arr, arr_shape, frame_count,
-                        cap_props, stop_flag):
-    """
-    Isolated subprocess: opens the camera and writes frames into shared memory.
-    libjpeg SIGSEGV / SIGABRT from corrupted MJPG data crash only this child;
-    the parent FCP process is completely unaffected.
-    """
-    # libjpeg writes "Corrupt JPEG data: premature end of data segment" straight
-    # to fd 2 from C — expected over a USB extender/usbipd link, not a Python
-    # warning, so silencing requires an OS-level fd redirect, not logging config.
-    _devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(_devnull, 2)
-
-    import cv2
-    import numpy as np
-
-    buf = np.frombuffer(shared_arr.get_obj(), dtype=np.uint8).reshape(arr_shape)
-
-    cap = cv2.VideoCapture(cam_idx, cv2.CAP_V4L2)
-    if fourcc_str:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc_str))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,      req_w)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,     req_h)
-    cap.set(cv2.CAP_PROP_FPS,              fps)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE,       4)
-    cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
-
-    # Report actual negotiated properties back to parent via shared array.
-    cap_props[0] = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    cap_props[1] = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    cap_props[2] = cap.get(cv2.CAP_PROP_FPS) or fps
-    cap_props[3] = cap.get(cv2.CAP_PROP_SAR_NUM)
-    cap_props[4] = cap.get(cv2.CAP_PROP_SAR_DEN)
-
-    while not stop_flag.value:
-        try:
-            ret, frame = cap.read()
-        except Exception:
-            continue
-        if not ret or frame is None or frame.size == 0:
-            continue
-        if frame.shape == arr_shape:
-            np.copyto(buf, frame)
-            with frame_count.get_lock():
-                frame_count.value += 1
-
-    cap.release()
-
-
-class _LiveCapture:
-    """
-    Camera capture using an isolated subprocess for crash safety.
-
-    libjpeg aborts (SIGSEGV / SIGABRT) from corrupted MJPG data kill only the
-    worker subprocess; the parent FCP process survives and the worker restarts
-    automatically on the next frame cycle.
-    """
-
-    _CTX = _mp.get_context('spawn')  # safe with Qt's multi-threaded parent
-
-    def __init__(self, cam_idx: int, fourcc_str: str | None,
-                 w: int, h: int, fps: int):
-        self._cam_idx    = cam_idx
-        self._fourcc_str = fourcc_str
-        self._req_w      = w
-        self._req_h      = h
-        self._req_fps    = fps
-        self._shape      = (h, w, 3)
-
-        self._frame: np.ndarray | None = None
-        self._lock   = threading.Lock()
-        self._ready  = threading.Event()
-        self._stopped = False
-
-        n = h * w * 3
-        self._shared_arr  = self._CTX.Array(_ct.c_uint8,  n)
-        self._frame_count = self._CTX.Value(_ct.c_uint64, 0)
-        self._stop_flag   = self._CTX.Value(_ct.c_bool,   False)
-        self._cap_props   = self._CTX.Array(_ct.c_double, 5)  # w,h,fps,sar_n,sar_d
-
-        self._start_worker()
-        self._mon = threading.Thread(target=self._monitor, daemon=True,
-                                     name='LiveCapMon')
-        self._mon.start()
-
-    def _start_worker(self):
-        self._proc = self._CTX.Process(
-            target=_camera_worker_proc,
-            args=(self._cam_idx, self._fourcc_str,
-                  self._req_w, self._req_h, self._req_fps,
-                  self._shared_arr, self._shape,
-                  self._frame_count, self._cap_props, self._stop_flag),
-            daemon=True,
-        )
-        self._proc.start()
-
-    def _monitor(self):
-        buf  = np.frombuffer(self._shared_arr.get_obj(),
-                             dtype=np.uint8).reshape(self._shape)
-        last = 0
-        while not self._stopped:
-            if not self._proc.is_alive() and not self._stop_flag.value:
-                print(f'[Camera] worker crashed (exit {self._proc.exitcode}), restarting...')
-                self._start_worker()
-            with self._frame_count.get_lock():
-                cnt = self._frame_count.value
-            if cnt != last:
-                last  = cnt
-                frame = buf.copy()
-                with self._lock:
-                    self._frame = frame
-                self._ready.set()
-            else:
-                time.sleep(0.005)
-
-    def read(self) -> np.ndarray | None:
-        with self._lock:
-            return None if self._frame is None else self._frame.copy()
-
-    def wait_first(self, timeout: float = 5.0) -> bool:
-        return self._ready.wait(timeout)
-
-    def get_props(self) -> tuple:
-        """(act_w, act_h, fps, sar_num, sar_den) as reported by the subprocess."""
-        return tuple(self._cap_props)
-
-    def stop(self):
-        self._stopped = True
-        self._stop_flag.value = True
-        if self._proc.is_alive():
-            self._proc.terminate()
-            self._proc.join(timeout=2.0)
+from cv.camera_capture import open_live_camera
 
 
 class CVEngine:
@@ -291,47 +151,13 @@ class CVEngine:
 
         is_live = getattr(cfg, 'USE_LIVE_CAMERA', False)
         if is_live:
-            cam_idx = getattr(cfg, 'CAMERA_INDEX', 0)
-            import os as _os
-            dev_path = f'/dev/video{cam_idx}'
-            if not _os.path.exists(dev_path):
-                self._error = (
-                    f"{dev_path} not found — camera not attached to WSL. "
-                    f"Run in PowerShell (Admin):  usbipd attach --wsl --busid <ID>")
+            cam_device = getattr(cfg, 'CAMERA_INDEX', 0)
+            live_cap, err = open_live_camera(cam_device, log_prefix='[CVEngine]')
+            if live_cap is None:
+                self._error = err
                 return
-            # Try formats in order until frames actually arrive.
-            # MJPG 640x480@30fps is listed first — it's the mode that actually
-            # works on the field camera/USB extender; YUYV never negotiates
-            # frames on that hardware and just wastes probe time (~5s/attempt).
-            _candidates = [
-                ('MJPG',  640, 480, 30),
-                ('MJPG',  640, 480, 15),
-                ('MJPG',  320, 240, 30),
-                ('YUYV',  640, 480, 30),
-                ('YUYV',  640, 480, 15),
-                ('YUYV',  320, 240, 30),
-                (None,    640, 480, 15),   # let driver pick
-            ]
-            live_cap      = None
-            neg_fourcc    = None
-            neg_w = neg_h = neg_fps = 0
-            for fourcc_str, w, h, fps in _candidates:
-                print(f'[CVEngine] trying {fourcc_str or "auto"} {w}x{h}@{fps}fps ...')
-                live_cap = _LiveCapture(cam_idx, fourcc_str, w, h, fps)
-                if live_cap.wait_first(timeout=5.0):
-                    act_w, act_h, act_fps, _, _ = live_cap.get_props()
-                    act_w, act_h = int(act_w) or w, int(act_h) or h
-                    print(f'[CVEngine] camera OK: {fourcc_str or "auto"} '
-                          f'{act_w}x{act_h} @{act_fps:.0f}fps')
-                    neg_fourcc, neg_w, neg_h, neg_fps = fourcc_str, act_w, act_h, act_fps
-                    break
-                print(f'[CVEngine] no frames — skipping')
-                live_cap.stop()
-                live_cap = None
-            else:
-                self._error = ("Camera opened but no frames received — "
-                               "check usbipd attach and /dev/video permissions")
-                return
+            neg_w, neg_h, neg_fps, _, _ = live_cap.get_props()
+            neg_w, neg_h = int(neg_w), int(neg_h)
         else:
             cap = cv2.VideoCapture(self._video_path)
             if not cap.isOpened():
@@ -591,4 +417,4 @@ class CVEngine:
             live_cap.stop()
         else:
             reader.stop()
-        cap.release()
+            cap.release()

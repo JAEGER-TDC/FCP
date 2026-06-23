@@ -143,7 +143,13 @@ class FCPController:
                 primary_rat = self.model.rats[primary_id]
                 if primary_rat.zone >= 2:
                     fire = 1 if primary_id in self.model.engaged_rats else 0
-                    state_cmd = 2 if fire else 1
+                    # Per myStateMachine.h on the real DNE firmware:
+                    # IDLE=0, CALIBRATE=1, TRACKING=2, ENGAGE=3. Sending 1 here
+                    # (our old assumption that 1 meant "track only") actually
+                    # puts the board in CALIBRATE mode, which treats az/el as
+                    # a literal calibration target with 222deg as a special
+                    # "zero this axis" sentinel — not normal tracking at all.
+                    state_cmd = 3 if fire else 2
                     self._send_dne_targeting(primary_rat, fire=fire, state_command=state_cmd)
 
         elif data_dict.get('msg_type') == 'health':
@@ -375,7 +381,7 @@ class FCPController:
         del_ = -delta_y * self._cam_vfov_deg / fh
 
         fire      = 1 if rat_id in self.model.engaged_rats else 0
-        state_cmd = 2 if fire else 1
+        state_cmd = 3 if fire else 2   # TRACKING=2 / ENGAGE=3 — see myStateMachine.h
         corrected = Rat({
             'rat_id': rat.rat_id, 'zone': rat.zone,
             'values': {'az_value':    rat.az_value    + daz,
@@ -401,7 +407,7 @@ class FCPController:
                     time.sleep(0.18)
         threading.Thread(target=_do, daemon=True).start()
 
-    def _send_dne_targeting(self, rat: Rat, fire: int = 0, state_command: int = 1,
+    def _send_dne_targeting(self, rat: Rat, fire: int = 0, state_command: int = 2,
                             hit_confirmation: int = 0):
         if self._ser is not None:
             try:
@@ -440,7 +446,7 @@ class FCPController:
                 self._dne_send_test_packet()
             else:
                 try:
-                    t = Target(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 1,
+                    t = Target(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 2,   # TRACKING, not CALIBRATE
                               time=int(time.time() * 1000))
                     with self._ser_lock:
                         self._ser.write(make_packet(t))
@@ -466,7 +472,7 @@ class FCPController:
         if self._ser is None:
             return
         fire      = 1 if self._test_laser_on else 0
-        state_cmd = 2 if self._test_laser_on else 1
+        state_cmd = 3 if self._test_laser_on else 2   # TRACKING=2 / ENGAGE=3
         try:
             t = Target(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, fire, state_cmd,
                       time=int(time.time() * 1000))
@@ -617,9 +623,25 @@ class FCPController:
     _ENGAGE_DWELL_S = 3.0   # seconds of continuous on-target crosshair lock for kill confirm
 
     def _poll_cv_state(self):
-        """Poll the CV engine metadata every 100 ms, update model, fire state-change alerts."""
-        if self.cv_engine is None:
+        """Poll the CV engine metadata every 100 ms.  Wrapped so that any
+        unexpected exception in the body can't silently kill this self-
+        rescheduling loop for the rest of the mission — without this guard,
+        one transient error would permanently stop CV tracking, the dwell/
+        kill-confirm timer, hit-confirm, and CV-corrected DNE targeting with
+        no operator-visible symptom beyond a console traceback."""
+        try:
+            self._poll_cv_state_impl()
+        except Exception as e:
+            import traceback
+            print(f"_poll_cv_state error (continuing): {e}")
+            traceback.print_exc()
+        finally:
             self.view.after(100, self._poll_cv_state)
+
+    def _poll_cv_state_impl(self):
+        """Update model, fire state-change alerts. See _poll_cv_state for the
+        exception-safety wrapper that calls this every 100 ms."""
+        if self.cv_engine is None:
             return
 
         err = getattr(self.cv_engine, 'get_error', lambda: None)()
@@ -632,7 +654,6 @@ class FCPController:
                 _video = _default
             self.cv_engine = CVEngineSimulator(video_path=_video)
             self.view.video_frame.play_cv_engine(self.cv_engine)
-            self.view.after(100, self._poll_cv_state)
             return
 
         meta       = self.cv_engine.get_metadata()
@@ -720,8 +741,6 @@ class FCPController:
             pid = self.model.primary_target_id
             if pid and pid in self.model.rats and self.model.rats[pid].zone == 3:
                 self._send_cv_corrected_targeting(self.model.rats[pid], meta, pid)
-
-        self.view.after(100, self._poll_cv_state)   # reschedule
 
     # ── CV mode entry points (called by CVLaunchDialog and Load Video button) ──
 
@@ -831,7 +850,7 @@ class FCPController:
         self.view.after(0, lambda: self.view.control_frame.update_dwell_display(None, 0.0, self._ENGAGE_DWELL_S))
         rat = self.model.rats.get(rat_id)
         if rat:
-            self._send_dne_targeting(rat, fire=0, state_command=1, hit_confirmation=1)
+            self._send_dne_targeting(rat, fire=0, state_command=2, hit_confirmation=1)
         self._send_hit_confirmation(rat_id)
         self.model.analytics_db.log_rat_event(rat_id, 'neutralized')
         self.view.alert_frame.add_alert(f'RAT {rat_id} NEUTRALIZED', INFO)
@@ -910,6 +929,19 @@ class FCPController:
     _STALE_TIMEOUT = 10.0  # seconds before a RAT with no update is removed
 
     def _check_staleness(self):
+        """Same exception-safety wrapper as _poll_cv_state — a single error here
+        must not permanently stop staleness cleanup / zone-state propagation
+        for the rest of the mission."""
+        try:
+            self._check_staleness_impl()
+        except Exception as e:
+            import traceback
+            print(f"_check_staleness error (continuing): {e}")
+            traceback.print_exc()
+        finally:
+            self.view.after(5000, self._check_staleness)
+
+    def _check_staleness_impl(self):
         """Remove RATs that have not sent a positional update within _STALE_TIMEOUT seconds."""
         now = time.time()
 
@@ -950,7 +982,6 @@ class FCPController:
             self.view.map_frame.update_engagement_state(p, e))
         self.view.after(0, lambda: self.view.control_frame.update_engagement_active(
             bool(self.model.engaged_rats)))
-        self.view.after(5000, self._check_staleness)
 
     #===================================================================
 
@@ -981,7 +1012,7 @@ class FCPController:
             self.cv_engine.set_engaged(True)
         rat = self.model.rats.get(rat_id)
         if rat:
-            self._send_dne_targeting(rat, fire=1, state_command=2)
+            self._send_dne_targeting(rat, fire=1, state_command=3)   # ENGAGE
         pid = self.model.primary_target_id
         er  = set(self.model.engaged_rats)
         self.view.after(0, lambda p=pid, e=er:
@@ -1026,7 +1057,7 @@ class FCPController:
         self.model.pending_engage_rat_id = None
         rat = self.model.rats.get(pid)
         if rat and rat.zone >= 2:
-            self._send_dne_targeting(rat, fire=0, state_command=1)
+            self._send_dne_targeting(rat, fire=0, state_command=2)   # TRACKING
         if was_engaged:
             self.model.analytics_db.log_rat_event(pid, 'engage_cancelled')
             self.view.after(0, lambda i=pid: self.view.alert_frame.add_alert(

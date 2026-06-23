@@ -44,11 +44,24 @@
       "Bash(mkdir /home/lockheed/FCP/fcp/protocol)",
       "Bash(python3 -c \"import serial.tools.list_ports; print\\('ok'\\)\")",
       "Bash(cat)",
-      "Bash(rm /home/lockheed/FCP/simulators/dne_sim/pathcheck.py)"
+      "Bash(rm /home/lockheed/FCP/simulators/dne_sim/pathcheck.py)",
+      "Bash(udevadm info *)",
+      "Bash(grep -n \"fire, 1,\\\\|0, 1,$\\\\|state=1\\\\|, 0, 1\\\\b\" /home/lockheed/FCP/fcp/controller/fcp_controller.py)",
+      "Bash(grep -n \"state_command=1\\\\b\\\\|state_cmd = 2 if fire else 1\\\\|, 0, 1,$\" /home/lockheed/FCP/fcp/controller/fcp_controller.py)",
+      "Bash(timeout 8 poetry run python fcp/fcp_app.py)",
+      "Read(//tmp/**)",
+      "Bash(pkill -f \"fcp/fcp_app.py\")",
+      "Bash(pkill -9 -f \"fcp/fcp_app.py\")",
+      "Bash(pkill -9 -f \"timeout 10\")",
+      "Bash(rm -f /tmp/fcp_smoke_test.log)",
+      "Bash(timeout 10 poetry run python -u fcp/fcp_app.py)",
+      "Bash(echo \"--- exit code: $? ---\")",
+      "Bash(timeout 8 poetry run python -u fcp/fcp_app.py > /tmp/fcp_smoke_test2.log 2>&1 *)"
     ],
     "additionalDirectories": [
       "/home/lockheed/.claude/plans",
-      "/home/lockheed/FCP/fcp"
+      "/home/lockheed/FCP/fcp",
+      "/tmp"
     ]
   }
 }
